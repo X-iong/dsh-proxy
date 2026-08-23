@@ -14,6 +14,12 @@ DSH Desktop / Web sends LLM requests from a host Node process via the global `fe
 
 So when an API endpoint is blocked by Cloudflare per-IP (common for residential IP ranges), or you simply must egress through a proxy, TUN mode used to be the only answer. This plugin offers another: **swap the global fetch dispatcher for a `ProxyAgent` inside the host process**. All requests egress through your proxy, and Clash's rule mode keeps doing the routing (domestic direct, foreign proxied) — no conflict.
 
+## Before / After
+
+| Before (blocked by Cloudflare per-IP, 403) | After (model list loads) |
+|---|---|
+| ![Before: fetching models answers 403](docs/images/before-403.png) | ![After: model list fetched successfully](docs/images/after-success.png) |
+
 ## How it works
 
 The plugin runs in the same host Node process as DSH's LLM adapter. On load it:
@@ -33,38 +39,40 @@ Copy the whole block below and send it to your DSH Agent — it will install and
 
 ```text
 Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for DeepSeek Harness):
-1. Run: dsh plugin --profile web add github:BuLongY/dsh-proxy
-   (If it fails with "another plugin install recovery transaction is pending",
+1. Run: dsh plugin --profile desktop add github:BuLongY/dsh-proxy
+   (DSH Desktop uses the desktop profile; for a pure web deployment use web instead.
+    If it fails with "another plugin install recovery transaction is pending",
     rename %APPDATA%\DSH Desktop\plugin-install-recovery\state.json to state.json.bak and retry.
     If you hit ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED, copy the full allowBuilds key from the error
-    into %UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml and retry.)
-2. Remind me to restart DSH Desktop (or reload the web profile) so the plugin loads.
-3. After restart the proxy defaults to http://127.0.0.1:7890 (Clash mixed port).
-   If my proxy uses a different port, change proxyUrl in Settings → Plugins → dsh-proxy.
+    into %UserProfile%\.dsh\profiles\desktop\pnpm-workspace.yaml and retry.)
+2. Remind me to restart DSH Desktop so the plugin loads.
+3. After restart the proxy defaults to 127.0.0.1:7890 (Clash mixed port).
+   If my proxy uses a different host or port, edit it in Settings → Plugins → Plugin configuration → dsh-proxy; saving applies immediately, no restart.
 4. Verify with a provider that needs the proxy (click "Fetch available models").
 ```
 
 ### Option 2: manual CLI install
 
 ```powershell
-dsh plugin --profile web add github:BuLongY/dsh-proxy
+dsh plugin --profile desktop add github:BuLongY/dsh-proxy
 ```
 
-Then **restart DSH Desktop** (or reload the web profile). The proxy defaults to `http://127.0.0.1:7890` (Clash/mihomo mixed port).
+Then **restart DSH Desktop**. The proxy defaults to `127.0.0.1:7890` (Clash/mihomo mixed port).
 
-Once published to npm, `dsh plugin --profile web add dsh-proxy` also works (no build-allowance step).
+Once published to npm, `dsh plugin --profile desktop add dsh-proxy` also works (no build-allowance step).
 
 ## Configuration
 
-After install, adjust in **Settings → Plugins → dsh-proxy** (changes apply immediately, no restart):
+After install, edit in **Settings → Plugins → Plugin configuration → dsh-proxy** (saving applies immediately, no restart):
 
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Master switch. Off restores direct connections without uninstalling. |
-| `proxyUrl` | `http://127.0.0.1:7890` | HTTP proxy URL. Only `http://` / `https://`; for SOCKS5 use Clash's mixed port. |
+| `host` | `127.0.0.1` | Proxy server host. |
+| `port` | `7890` | Proxy server port (1–65535). |
 | `noProxy` | `localhost, 127.0.0.1, ::1, [::1]` | Bypass list: exact hostnames; leading `.` matches domain suffixes (e.g. `.lan`); `*` bypasses everything. |
 
-You can also edit the plugin's section in `%UserProfile%\.dsh\settings.yaml` directly.
+You can also edit the `dsh-proxy` section in `%UserProfile%\.dsh\settings.yaml` directly. HTTP proxies only; for SOCKS5 use Clash/mihomo's mixed port.
 
 ## Verify
 

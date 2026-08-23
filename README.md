@@ -14,6 +14,12 @@ DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Nod
 
 于是当某个 API 端点被 Cloudflare 按 IP 拦截（国内宽带段很常见）、或你必须经代理才能访问时，唯一的选择曾是 Clash 的 TUN 模式。本插件提供了另一条路：**在宿主进程内把全局 fetch 的 dispatcher 换成 ProxyAgent**，所有请求经你的代理出站，由 Clash 的规则模式继续负责分流（国内直连、国外走节点），互不冲突。
 
+## 效果对比
+
+| 使用前（被 Cloudflare 按 IP 拦截，403） | 使用后（正常拉出模型列表） |
+|---|---|
+| ![使用前：获取模型返回 403](docs/images/before-403.png) | ![使用后：成功获取模型列表](docs/images/after-success.png) |
+
 ## 工作原理
 
 插件与 DSH 的 LLM 适配器运行在同一个宿主 Node 进程中。加载时：
@@ -33,38 +39,40 @@ DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Nod
 
 ```text
 请帮我安装并启用 dsh-proxy 插件（DeepSeek Harness 的自定义 HTTP 代理插件）。步骤：
-1. 执行：dsh plugin --profile web add github:BuLongY/dsh-proxy
-   （如果提示有挂起的安装恢复事务 "another plugin install recovery transaction is pending"，
+1. 执行：dsh plugin --profile desktop add github:BuLongY/dsh-proxy
+   （DSH 桌面端用 desktop profile；纯 Web 部署则把 desktop 换成 web。
+    如果提示有挂起的安装恢复事务 "another plugin install recovery transaction is pending"，
     先把 %APPDATA%\DSH Desktop\plugin-install-recovery\state.json 重命名为 state.json.bak 隔离，再重试。
     如果报 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED，按报错提示把完整的 allowBuilds 键加入
-    %UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml 后重试。）
-2. 安装完成后提醒我重启 DSH Desktop（或重载 web profile）使插件生效。
-3. 重启后插件默认启用代理 http://127.0.0.1:7890（Clash 混合端口）。
-   如果我的代理端口不同，请在 设置 → 插件 → dsh-proxy 中修改 proxyUrl。
+    %UserProfile%\.dsh\profiles\desktop\pnpm-workspace.yaml 后重试。）
+2. 安装完成后提醒我重启 DSH Desktop 使插件生效。
+3. 重启后插件默认启用代理 127.0.0.1:7890（Clash 混合端口）。
+   如果我的代理地址或端口不同，请在 设置 → 插件 → 插件配置 → dsh-proxy 中直接修改，保存即生效，无需重启。
 4. 用一个需要代理的 API 提供方（点"获取可用模型"）验证是否成功。
 ```
 
 ### 方式二：命令行手动安装
 
 ```powershell
-dsh plugin --profile web add github:BuLongY/dsh-proxy
+dsh plugin --profile desktop add github:BuLongY/dsh-proxy
 ```
 
-然后**重启 DSH Desktop**（或重载 web profile）。插件默认启用 `http://127.0.0.1:7890`（Clash/mihomo 混合端口）。
+然后**重启 DSH Desktop**。插件默认启用 `127.0.0.1:7890`（Clash/mihomo 混合端口）。
 
-发布到 npm 后也可直接 `dsh plugin --profile web add dsh-proxy`（无需构建放行步骤）。
+发布到 npm 后也可直接 `dsh plugin --profile desktop add dsh-proxy`（无需构建放行步骤）。
 
 ## 配置
 
-安装后在 **设置 → 插件 → dsh-proxy** 中调整（改动即时生效，无需重启）：
+安装后在 **设置 → 插件 → 插件配置 → dsh-proxy** 中直接编辑（保存即时生效，无需重启）：
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关。关闭即恢复直连，无需卸载。 |
-| `proxyUrl` | `http://127.0.0.1:7890` | HTTP 代理地址。仅支持 `http://` / `https://`；SOCKS5 用户请在 Clash 里使用混合端口。 |
+| `host` | `127.0.0.1` | 代理服务器地址。 |
+| `port` | `7890` | 代理服务器端口（1–65535）。 |
 | `noProxy` | `localhost, 127.0.0.1, ::1, [::1]` | 绕过名单：精确匹配主机名；以 `.` 开头匹配域名后缀（如 `.lan`）；`*` 表示全部直连。 |
 
-也可以直接编辑 `%UserProfile%\.dsh\settings.yaml` 中对应的插件配置节。
+也可以直接编辑 `%UserProfile%\.dsh\settings.yaml` 中的 `dsh-proxy` 配置节。仅支持 HTTP 代理；SOCKS5 用户请使用 Clash/mihomo 的混合端口。
 
 ## 验证
 
