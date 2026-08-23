@@ -53,7 +53,7 @@ dsh plugin --profile web add dsh-proxy
 ### 从 GitHub 安装最新开发版
 
 ```powershell
-dsh plugin --profile web add github:<owner>/dsh-proxy
+dsh plugin --profile web add github:BuLongY/dsh-proxy
 ```
 
 若报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，按报错提示把完整的 `allowBuilds` 键加入 `%UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml` 后重试。

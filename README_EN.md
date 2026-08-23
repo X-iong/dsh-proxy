@@ -53,7 +53,7 @@ Then **restart DSH Desktop** (or reload the web profile). The proxy defaults to 
 ### Latest development version from GitHub
 
 ```powershell
-dsh plugin --profile web add github:<owner>/dsh-proxy
+dsh plugin --profile web add github:BuLongY/dsh-proxy
 ```
 
 If you hit `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`, copy the full `allowBuilds` key from the error into `%UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml` and retry.
