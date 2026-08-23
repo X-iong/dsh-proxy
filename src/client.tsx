@@ -374,11 +374,8 @@ function ProxyCard(props: ProxyCardProps) {
 }
 
 export const name = 'dsh-proxy-client'
-export const inject = [
-  '@deepseek-ai/dsh-client-runtime',
-  '@deepseek-ai/dsh-client-ui-settings',
-  '@deepseek-ai/dsh-client-ui-slots',
-]
+/** Required services (cordis fiber inject) — service names, not package names. */
+export const inject = ['settingsScope', 'slots']
 
 interface ClientContext {
   settingsScope: { bind(spec: { namespace: string }): SettingsScope }
