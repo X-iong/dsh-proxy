@@ -33,9 +33,11 @@ DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Nod
 
 ```text
 请帮我安装并启用 dsh-proxy 插件（DeepSeek Harness 的自定义 HTTP 代理插件）。步骤：
-1. 执行：dsh plugin --profile web add dsh-proxy
+1. 执行：dsh plugin --profile web add github:BuLongY/dsh-proxy
    （如果提示有挂起的安装恢复事务 "another plugin install recovery transaction is pending"，
-    先把 %APPDATA%\DSH Desktop\plugin-install-recovery\state.json 重命名为 state.json.bak 隔离，再重试。）
+    先把 %APPDATA%\DSH Desktop\plugin-install-recovery\state.json 重命名为 state.json.bak 隔离，再重试。
+    如果报 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED，按报错提示把完整的 allowBuilds 键加入
+    %UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml 后重试。）
 2. 安装完成后提醒我重启 DSH Desktop（或重载 web profile）使插件生效。
 3. 重启后插件默认启用代理 http://127.0.0.1:7890（Clash 混合端口）。
    如果我的代理端口不同，请在 设置 → 插件 → dsh-proxy 中修改 proxyUrl。
@@ -45,18 +47,12 @@ DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Nod
 ### 方式二：命令行手动安装
 
 ```powershell
-dsh plugin --profile web add dsh-proxy
+dsh plugin --profile web add github:BuLongY/dsh-proxy
 ```
 
 然后**重启 DSH Desktop**（或重载 web profile）。插件默认启用 `http://127.0.0.1:7890`（Clash/mihomo 混合端口）。
 
-### 从 GitHub 安装最新开发版
-
-```powershell
-dsh plugin --profile web add github:BuLongY/dsh-proxy
-```
-
-若报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，按报错提示把完整的 `allowBuilds` 键加入 `%UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml` 后重试。
+发布到 npm 后也可直接 `dsh plugin --profile web add dsh-proxy`（无需构建放行步骤）。
 
 ## 配置
 

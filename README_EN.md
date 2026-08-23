@@ -33,9 +33,11 @@ Copy the whole block below and send it to your DSH Agent — it will install and
 
 ```text
 Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for DeepSeek Harness):
-1. Run: dsh plugin --profile web add dsh-proxy
+1. Run: dsh plugin --profile web add github:BuLongY/dsh-proxy
    (If it fails with "another plugin install recovery transaction is pending",
-    rename %APPDATA%\DSH Desktop\plugin-install-recovery\state.json to state.json.bak and retry.)
+    rename %APPDATA%\DSH Desktop\plugin-install-recovery\state.json to state.json.bak and retry.
+    If you hit ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED, copy the full allowBuilds key from the error
+    into %UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml and retry.)
 2. Remind me to restart DSH Desktop (or reload the web profile) so the plugin loads.
 3. After restart the proxy defaults to http://127.0.0.1:7890 (Clash mixed port).
    If my proxy uses a different port, change proxyUrl in Settings → Plugins → dsh-proxy.
@@ -45,18 +47,12 @@ Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for D
 ### Option 2: manual CLI install
 
 ```powershell
-dsh plugin --profile web add dsh-proxy
+dsh plugin --profile web add github:BuLongY/dsh-proxy
 ```
 
 Then **restart DSH Desktop** (or reload the web profile). The proxy defaults to `http://127.0.0.1:7890` (Clash/mihomo mixed port).
 
-### Latest development version from GitHub
-
-```powershell
-dsh plugin --profile web add github:BuLongY/dsh-proxy
-```
-
-If you hit `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`, copy the full `allowBuilds` key from the error into `%UserProfile%\.dsh\profiles\web\pnpm-workspace.yaml` and retry.
+Once published to npm, `dsh plugin --profile web add dsh-proxy` also works (no build-allowance step).
 
 ## Configuration
 
