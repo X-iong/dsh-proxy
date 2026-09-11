@@ -65,7 +65,9 @@ async function fakeProxy(port) {
         socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok')
       } else {
         // Malformed status line -> immediate protocol error, no retry storm.
-        socket.end('HTTP/1.1 ABC Nope\r\nContent-Length: 2\r\n\r\nok')
+        // Deliberately `write`, not `end`: half-closing leaves a socket undici
+        // keeps retrying on, which starves the next (healthy) probe.
+        socket.write('HTTP/1.1 ABC Nope\r\nContent-Length: 2\r\n\r\nok')
       }
     })
   })
@@ -137,7 +139,7 @@ test('a healthy tunnel keeps the proxy installed and never degrades', async (t) 
   ])
 })
 
-test('a failing upstream probe degrades to direct while the port stays up', async (t) => {
+test('a failing upstream probe reports the tunnel broken WITHOUT leaving the proxy', async (t) => {
   const port = 7912
   const proxy = await fakeProxy(port)
   t.after(() => proxy.close())
@@ -145,19 +147,41 @@ test('a failing upstream probe degrades to direct while the port stays up', asyn
 
   await waitFor(() => modeOf() === 'proxy', 5000, 'mode to become proxy on the healthy tunnel')
 
-  // Tunnel dies but the listener stays up: this is the S4 gap — a reachable port
-  // is not proof that traffic flows.
+  // Tunnel dies but the listener stays up: the port answers, the tunnel does not.
   proxy.state.mode = 'dead'
-  await waitFor(() => modeOf() === 'direct', 5000, 'degrade to direct after the upstream probe fails')
-  assert.ok(
-    hasTransition('proxy→direct reason=upstream-unreachable'),
-    `expected an upstream-unreachable degrade line, got ${JSON.stringify(lines)}`,
+  await waitFor(
+    () => lines.some((line) => line.includes('隧道坏了')),
+    5000,
+    'the Chinese "tunnel is broken" warning',
   )
-  assert.ok(lines.some((line) => line.includes('upstream probe failed')), 'the degrade must be driven by a failed upstream probe')
 
-  // Deeper check: the port was never closed by the harness, so this cannot be
-  // port-liveness degradation.
-  assert.notEqual(modeOf(), 'proxy', 'must not still be on the dead tunnel')
+  // Policy B: being told is the whole response. Leaving the tunnel would move
+  // every host-side request off it, and only the user knows whether direct
+  // reaches the destinations they care about.
+  assert.equal(modeOf(), 'proxy', 'the proxy must stay installed; the plugin never abandons the tunnel on its own')
+  assert.equal(hasTransition('proxy→direct'), false, 'a broken tunnel must not produce a mode switch')
+  assert.ok(
+    lines.some((line) => line.includes('节点不可达')),
+    `the warning must name the cause, got ${JSON.stringify(lines)}`,
+  )
+  assert.ok(
+    lines.some((line) => line.includes('关闭代理改走直连')),
+    'the warning must tell the user what to do',
+  )
+  assert.ok(lines.some((line) => line.includes('upstream probe failed')), 'the verdict must come from a failed upstream probe')
+
+  // Healed tunnel: the verdict clears and routing never moved.
+  proxy.state.mode = 'healthy'
+  try {
+    await waitFor(
+      () => lines.some((line) => line.includes('隧道已恢复')),
+      5000,
+      'the Chinese "tunnel recovered" notice',
+    )
+  } catch (error) {
+    throw new Error(`${error.message}\n  mode=${modeOf()}  proxyRequests=${proxy.state.requests}\n  lines=${JSON.stringify(lines)}`)
+  }
+  assert.equal(modeOf(), 'proxy', 'recovery must not move routing either')
 })
 
 test('a proxy that comes back after being absent is switched to again (recovery)', async (t) => {

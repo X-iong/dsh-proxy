@@ -1,7 +1,8 @@
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
-import { connect } from 'node:net'
+import { connect, type Socket } from 'node:net'
+import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import {
   Agent,
   Dispatcher,
@@ -54,7 +55,7 @@ const PROBE_INTERVAL_MS = 10000
 /** TCP connect timeout for one liveness probe. */
 const PROBE_TIMEOUT_MS = 2000
 /** Upstream fetch timeout: how long a probe request may take before we treat the tunnel as broken. */
-const UPSTREAM_TIMEOUT_MS = 8000
+const UPSTREAM_TIMEOUT_MS = 3000
 /** Graceful periodic pool reset interval. */
 const RESET_INTERVAL_MS = 60000
 /** Run the upstream probe every N-th liveness cycle (N * PROBE_INTERVAL_MS). */
@@ -240,13 +241,26 @@ export function apply(ctx: Context, config: ProxyConfig) {
   let upstreamHealthy = true
   /** Consecutive upstream-probe failures; any successful probe resets it. */
   let upstreamFailures = 0
+  /** Wall-clock ms when the tunnel was last judged broken (for the status readout). */
+  let tunnelBrokenAt: number | undefined
   /** Routing mode of the installed dispatcher (undefined while none is installed). */
   let mode: 'proxy' | 'direct' | undefined
   /** Backoff window currently enforced between reactive rebuilds. */
   let rebuildBackoffMs = REBUILD_DEBOUNCE_MS
   /** When the last rebuild happened, measured against rebuildBackoffMs. */
   let lastRebuildAt = 0
-  let probing = false
+  /**
+   * When a request last died on the wire while we were routing through the proxy.
+   * This arrives BEFORE the model layer turns the failure into user-visible text,
+   * which is what lets that very text be corrected (see decorateTunnelFailures).
+   */
+  let proxiedTransportErrorAt = 0
+  // Liveness and upstream probing hold SEPARATE in-flight guards. One shared guard
+  // let a stuck upstream probe (up to UPSTREAM_TIMEOUT_MS) starve the 2-second
+  // liveness probe, so a port that had disappeared went unnoticed for the whole
+  // upstream timeout — measured at 8,008 ms against a 200 ms cadence.
+  let probingLiveness = false
+  let probingUpstream = false
   let disposed = false
   let timer: ReturnType<typeof setInterval> | undefined
   let resetTimer: ReturnType<typeof setInterval> | undefined
@@ -255,12 +269,22 @@ export function apply(ctx: Context, config: ProxyConfig) {
   const isAutoReset = () => current().autoReset !== false
 
   /**
-   * The routing decision, in one place: the proxy is used only while the port is
-   * reachable AND the tunnel is healthy. A reachable port with an unhealthy
-   * tunnel degrades to direct, and the upstream probe keeps running, which is
-   * what lets the proxy come back on its own.
+   * Routing decision. Policy: the tunnel is NEVER abandoned automatically. While
+   * the proxy port answers, host-side traffic keeps going through the proxy even
+   * if the tunnel looks broken — silently leaving it would move every request off
+   * the tunnel, and only the user knows whether direct reaches the destinations
+   * they care about. A port that is not listening is different: there is no tunnel
+   * to use, which is exactly the "VPN off = direct" case.
    */
-  const shouldUseProxy = () => alive && upstreamHealthy
+  const shouldUseProxy = () => alive
+
+  /**
+   * Whether churning the connection pool can plausibly help. A rebuild cannot
+   * repair a tunnel already judged broken, and rebuilding on every failed request
+   * while it is down would only add load, so reactive rebuilds stay gated on the
+   * tunnel verdict even though routing does not.
+   */
+  const rebuildHelps = () => alive && upstreamHealthy
 
   /**
    * Record the routing mode and emit exactly one structurally stable line per
@@ -342,10 +366,10 @@ export function apply(ctx: Context, config: ProxyConfig) {
   /** Debounced, backed-off reactive reset: a burst of transport failures triggers one rebuild. */
   const scheduleRebuild = (error: any) => {
     if (!isAutoReset() || disposed || installed === undefined) return
-    // Only while traffic really goes through the proxy: a plain network error on
-    // the direct path (bypass-listed host, or a degraded tunnel) must not churn
-    // the proxy connection pool.
-    if (!shouldUseProxy()) return
+    // A rebuild cannot repair a tunnel already judged broken, and rebuilding on
+    // every failed request while it is down would only add load. Routing stays on
+    // the proxy either way; only the pool churn is gated here (S11).
+    if (!rebuildHelps()) return
     if (resetPending) return
     // Exponential backoff on top of the debounce, so a sustained burst cannot
     // destroy the pool on every single failure.
@@ -359,35 +383,191 @@ export function apply(ctx: Context, config: ProxyConfig) {
   }
 
   const onTransportError = (error: any) => {
+    // A request that failed on the wire while we are routing through the proxy is
+    // evidence about the tunnel. Recorded here, not at the probe, so the verdict
+    // can be reached from real traffic instead of waiting for the next cycle.
+    if (mode === 'proxy') proxiedTransportErrorAt = Date.now()
     scheduleRebuild(error)
   }
 
+  /** How long a wire failure keeps the tunnel under suspicion. */
+  const TUNNEL_SUSPECT_MS = 30000
+
+  /** Whether a failed model request plausibly died because the tunnel is down. */
+  const tunnelIsSuspect = () =>
+    mode === 'proxy'
+    && (!upstreamHealthy || Date.now() - proxiedTransportErrorAt < TUNNEL_SUSPECT_MS)
+
   /**
-   * Real HTTP probe through a throwaway ProxyAgent: does the tunnel reach the
-   * internet? Any HTTP response (2xx/4xx/5xx) proves the bytes flowed.
+   * Make a model request that died on the wire say so in Chinese.
+   *
+   * The adapter wraps every transport failure in a fixed English sentence
+   * (`DeepSeek API stream from <baseURL> failed`) and `normalizeLlmFailure` keeps
+   * ONLY that message — the underlying cause never reaches the user, and because
+   * the result is an `LlmError` the cause-chain renderer is not used either. So
+   * rewriting the original error is pointless.
+   *
+   * The last place the text is still ours is the terminal `finish` chunk:
+   * agent-loop builds its error from exactly `finish.failure.message`, and that is
+   * what lands in `turn/end` and therefore in the conversation. Rewriting it
+   * changes only the wording — `code` stays `TRANSPORT`, so retry policy, error
+   * classification, and every consumer that routes on the code are unaffected.
    */
-  const probeUpstream = async (cfg: ProxyConfig): Promise<boolean> => {
-    const agent = new ProxyAgent({ uri: proxyUrlOf(cfg) })
-    try {
-      const response = await fetch(cfg.probeUrl ?? DEFAULT_PROBE_URL, {
-        method: 'GET',
-        dispatcher: agent,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-      } as RequestInit)
-      const body: any = response?.body
-      if (body && typeof body.cancel === 'function') body.cancel().catch(() => { })
-      return true
-    } catch {
-      return false
-    } finally {
-      agent.close().catch(() => { })
+  const maybeRenameTunnelFailure = (chunk: any): any => {
+    if (chunk?.type !== 'finish') return chunk
+    const reason = chunk.reason
+    if (reason?.kind !== 'error' || reason.failure?.code !== 'TRANSPORT') return chunk
+    if (!tunnelIsSuspect()) return chunk
+    const failure = reason.failure
+    // Hedged on purpose: a wire failure through the proxy can also mean the
+    // upstream itself is unreachable, and asserting "the node is dead" would be
+    // wrong in exactly the case where it matters most.
+    return {
+      ...chunk,
+      reason: {
+        ...reason,
+        failure: {
+          ...failure,
+          message: `${failure.message}\n`
+            + 'dsh-proxy: 这次模型请求经代理出站失败 —— 隧道不通（常见原因是代理节点挂了）。'
+            + '请切换到可用节点，或关闭代理改走直连后重试。',
+        },
+      },
     }
   }
 
-  const probe = async () => {
-    if (probing || disposed) return
-    probing = true
+  /** Wrap one model-call stream so a suspect tunnel failure is reported in Chinese. */
+  const decorateTunnelFailures = (source: AsyncIterable<any>): AsyncIterable<any> => ({
+    async *[Symbol.asyncIterator]() {
+      for await (const chunk of source) yield maybeRenameTunnelFailure(chunk)
+    },
+  })
+
+  /** A parseable HTTP status line — the proof that a real response came back. */
+  const STATUS_LINE = /^HTTP\/1\.[01] \d{3}/
+
+  /**
+   * The tunnel probe: ONE connection, end to end, and no retry loop.
+   *
+   * Deliberately not `fetch` through a throwaway ProxyAgent. undici retries a
+   * request whose connection closed before a response arrived, so against a proxy
+   * that accepts and then resets (a dead node) a single probe became a retry storm
+   * — measured at 23,532–25,432 requests inside the abort window, aimed at the
+   * LOCAL proxy — and it could only conclude when that timeout expired (8,005 ms
+   * against a proxy that simply never answers).
+   *
+   * Doing the round trip by hand keeps the check genuinely end-to-end (real
+   * CONNECT, real TLS handshake, real HTTP request to the real upstream) while
+   * making it exactly one request with a timeout we choose. Sensitivity is
+   * therefore unchanged: a response is still required to call the tunnel healthy.
+   */
+  const probeUpstream = (cfg: ProxyConfig, timeoutMs: number): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const target = new URL(cfg.probeUrl ?? DEFAULT_PROBE_URL)
+      const secure = target.protocol === 'https:'
+      const targetPort = Number(target.port === '' ? (secure ? 443 : 80) : target.port)
+      const proxyHost = connectHost(cfg)
+      const proxyPort = cfg.port ?? 7890
+
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let proxySocket: Socket | undefined
+      let stream: Socket | TLSSocket | undefined
+
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        stream?.destroy()
+        proxySocket?.destroy()
+        resolve(ok)
+      }
+
+      const requestUpstream = (transport: Socket | TLSSocket) => {
+        stream = transport
+        transport.on('data', (chunk: Buffer) => {
+          if (STATUS_LINE.test(chunk.toString('latin1'))) finish(true)
+        })
+        transport.once('error', () => finish(false))
+        transport.once('close', () => finish(false))
+        // Plain HTTP goes to the proxy in absolute form; over a tunnel only the
+        // origin-form target is sent.
+        const requestTarget = secure ? `${target.pathname}${target.search}` : target.href
+        transport.write(
+          `GET ${requestTarget} HTTP/1.1\r\n`
+          + `Host: ${target.host}\r\n`
+          + 'User-Agent: dsh-proxy-probe\r\n'
+          + 'Accept: */*\r\n'
+          + 'Connection: close\r\n\r\n',
+        )
+      }
+
+      timer = setTimeout(() => finish(false), timeoutMs)
+      proxySocket = connect({ host: proxyHost, port: proxyPort })
+      proxySocket.once('error', () => finish(false))
+      proxySocket.once('connect', () => {
+        if (settled) return
+        if (!secure) {
+          requestUpstream(proxySocket as Socket)
+          return
+        }
+        let head = ''
+        const onHead = (chunk: Buffer) => {
+          head += chunk.toString('latin1')
+          if (!head.includes('\r\n\r\n')) return
+          proxySocket?.off('data', onHead)
+          const status = Number(head.slice(0, head.indexOf('\r\n')).split(' ')[1])
+          if (!(status >= 200 && status < 300)) {
+            finish(false)
+            return
+          }
+          // Speak TLS *inside* the tunnel: accepting a CONNECT is not the same as
+          // being able to carry traffic, and a probe that stopped at CONNECT would
+          // call a broken node healthy.
+          const tls = tlsConnect({ socket: proxySocket as Socket, servername: target.hostname })
+          tls.once('secureConnect', () => requestUpstream(tls))
+          tls.once('error', () => finish(false))
+        }
+        proxySocket?.on('data', onHead)
+        proxySocket?.write(
+          `CONNECT ${target.hostname}:${targetPort} HTTP/1.1\r\n`
+          + `Host: ${target.hostname}:${targetPort}\r\n\r\n`,
+        )
+      })
+    })
+
+  /** Forget the tunnel verdict — it described an endpoint we are no longer judging. */
+  const clearTunnelVerdict = () => {
+    const wasBroken = !upstreamHealthy
+    upstreamHealthy = true
+    upstreamFailures = 0
+    tunnelBrokenAt = undefined
+    if (wasBroken) logger.info('dsh-proxy: 隧道判定已重置（端口消失或配置变更），下次端口可达时重新判定')
+  }
+
+  /**
+   * Record that the tunnel is broken WITHOUT leaving it, and say so in Chinese.
+   * Nothing is rerouted here: the user asked to be told, not to be moved.
+   */
+  const markTunnelBroken = () => {
+    if (!upstreamHealthy) return
+    upstreamHealthy = false
+    tunnelBrokenAt = Date.now()
+    logger.warn(
+      `dsh-proxy: 隧道坏了（代理节点不可达）——上游探测 ${upstreamFailures} 次连续失败`
+      + `（目标 ${current().probeUrl ?? DEFAULT_PROBE_URL}）。`
+      + '请切换到可用节点，或关闭代理改走直连。按当前设置插件不会自动改走直连。',
+    )
+  }
+
+  /**
+   * Port liveness only: cheap, on its own cadence, and never blocked by the
+   * upstream probe. This is the only probe allowed to move traffic between the
+   * proxy and direct.
+   */
+  const probeLiveness = async () => {
+    if (probingLiveness || disposed) return
+    probingLiveness = true
     try {
       const cfg = current()
       if (cfg.enabled === false) {
@@ -406,63 +586,62 @@ export function apply(ctx: Context, config: ProxyConfig) {
           ? `dsh-proxy: proxy reachable at ${host}:${port} — routing through it`
           : `dsh-proxy: proxy unreachable at ${host}:${port} — falling back to direct`)
       }
-      if (!reachable) {
-        // The port is gone, so the tunnel verdict goes with it: the next time
-        // the port answers it is tried as a proxy before it is judged.
-        upstreamHealthy = true
-        upstreamFailures = 0
-      }
-      // Decision table (see shouldUseProxy): proxy only while the port answers
-      // and the tunnel is healthy; a reachable port with a dead tunnel degrades
-      // to direct instead of staying on it.
+      if (!reachable) clearTunnelVerdict()
+      // Only the port decides routing; the tunnel verdict never does (see shouldUseProxy).
       const useProxy = shouldUseProxy()
       if (installed === undefined || mode !== (useProxy ? 'proxy' : 'direct')) {
         if (useProxy) install(cfg, true, 'port-reachable')
-        else installDirect(cfg, reachable ? 'upstream-unreachable' : 'port-unreachable')
-      }
-      // Upstream probe (every N-th cycle), gated only on the port being
-      // reachable — NOT on the routing mode, so a degraded tunnel keeps being
-      // probed and can come back on its own.
-      if (alive && isAutoReset() && installed !== undefined) {
-        probeCounter += 1
-        // Every N-th cycle normally; every cycle while the tunnel is degraded, so
-        // recovery does not have to wait for a whole probe interval.
-        const dueUpstream = probeCounter % UPSTREAM_PROBE_EVERY === 0 || !upstreamHealthy
-        if (dueUpstream) {
-          const up = await probeUpstream(cfg)
-          // Disposal may have landed while the probe was in flight; stop rather
-          // than acting on a verdict about an endpoint this fiber no longer owns.
-          if (disposed) return
-          if (up) {
-            upstreamHealthy = true
-            upstreamFailures = 0
-            rebuildBackoffMs = REBUILD_DEBOUNCE_MS
-            if (mode !== 'proxy') install(cfg, true, 'upstream-recovered')
-          } else {
-            upstreamFailures += 1
-            if (upstreamHealthy) {
-              logger.warn('dsh-proxy: upstream probe failed — rebuilding connection pool')
-              rebuild('upstream probe failed', true)
-              if (upstreamFailures >= UPSTREAM_FAIL_THRESHOLD) {
-                upstreamHealthy = false
-                // Degrade for real. The probe above keeps running, so the next
-                // successful upstream probe switches straight back to proxy.
-                installDirect(cfg, `upstream-unreachable failures=${upstreamFailures}`)
-              }
-            }
-          }
-        }
+        else installDirect(cfg, 'port-unreachable')
       }
     } catch (error) {
       logger.warn('dsh-proxy: proxy probe failed:', error)
       if (alive) {
         alive = false
-        upstreamHealthy = true
-        upstreamFailures = 0
+        clearTunnelVerdict()
         installDirect(current(), 'port-unreachable')
       }
     } finally {
-      probing = false
+      probingLiveness = false
+    }
+  }
+
+  /**
+   * Tunnel health: the expensive end-to-end check, on its own guard so it can
+   * never delay liveness. Under the current policy it reroutes nothing — it only
+   * maintains the verdict the user is told about.
+   */
+  const probeUpstreamCycle = async () => {
+    if (probingUpstream || disposed) return
+    if (!alive || !isAutoReset() || installed === undefined) return
+    const cfg = current()
+    if (cfg.enabled === false) return
+    probingUpstream = true
+    try {
+      probeCounter += 1
+      // Every N-th cycle normally; every cycle while the tunnel is broken, so
+      // recovery does not have to wait for a whole probe interval.
+      if (probeCounter % UPSTREAM_PROBE_EVERY !== 0 && upstreamHealthy) return
+      const up = await probeUpstream(cfg, UPSTREAM_TIMEOUT_MS)
+      // Disposal may have landed while the probe was in flight; stop rather than
+      // acting on a verdict about an endpoint this fiber no longer owns.
+      if (disposed) return
+      if (up) {
+        const wasBroken = !upstreamHealthy
+        upstreamHealthy = true
+        upstreamFailures = 0
+        tunnelBrokenAt = undefined
+        rebuildBackoffMs = REBUILD_DEBOUNCE_MS
+        if (wasBroken) logger.info('dsh-proxy: 隧道已恢复（上游探测成功），继续经代理出站')
+      } else {
+        upstreamFailures += 1
+        if (upstreamHealthy) {
+          logger.warn('dsh-proxy: upstream probe failed — rebuilding connection pool')
+          rebuild('upstream probe failed', true)
+          if (upstreamFailures >= UPSTREAM_FAIL_THRESHOLD) markTunnelBroken()
+        }
+      }
+    } finally {
+      probingUpstream = false
     }
   }
 
@@ -470,8 +649,13 @@ export function apply(ctx: Context, config: ProxyConfig) {
   // proxy is down never strands the process; the probe flips to proxy once the
   // port answers. With enabled=false this is a no-op and nothing is installed.
   installDirect(current(), 'startup')
-  void probe()
-  timer = setInterval(() => void probe(), PROBE_INTERVAL_MS)
+  void probeLiveness()
+  timer = setInterval(() => {
+    // Two independent probes behind two independent guards: a slow upstream check
+    // must never delay noticing that the proxy port appeared or disappeared.
+    void probeLiveness()
+    void probeUpstreamCycle()
+  }, PROBE_INTERVAL_MS)
   if (RESET_INTERVAL_MS > 0) {
     resetTimer = setInterval(() => {
       if (isAutoReset() && installed !== undefined && current().enabled !== false) {
@@ -493,10 +677,9 @@ export function apply(ctx: Context, config: ProxyConfig) {
           // drop to direct, then re-probe immediately against the new settings.
           // The tunnel verdict belongs to the old endpoint, so it is reset too.
           alive = false
-          upstreamHealthy = true
-          upstreamFailures = 0
+          clearTunnelVerdict()
           installDirect(current(), 'reconfigured')
-          void probe()
+          void probeLiveness()
         } catch (error) {
           logger.error('dsh-proxy: keeping the previous dispatcher after a refused update')
           logger.error(error)
@@ -508,6 +691,75 @@ export function apply(ctx: Context, config: ProxyConfig) {
   const events = ctx as unknown as {
     on?: (event: string, listener: (...args: never[]) => void) => void
   }
+
+  /**
+   * Read-only status for the settings card. With policy B a broken tunnel changes
+   * no routing, so this readout is the user's only way to see the verdict without
+   * reading the host log.
+   */
+  const statusSnapshot = () => {
+    const cfg = current()
+    const enabled = cfg.enabled !== false
+    return {
+      enabled,
+      host: connectHost(cfg),
+      port: cfg.port ?? 7890,
+      routing: !enabled ? 'disabled' : (mode ?? 'starting'),
+      tunnel: upstreamHealthy ? 'ok' : 'broken',
+      tunnelBrokenAt: tunnelBrokenAt ?? null,
+      upstreamFailures,
+      probeUrl: cfg.probeUrl ?? DEFAULT_PROBE_URL,
+      upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+      probeIntervalMs: PROBE_INTERVAL_MS,
+    }
+  }
+
+  // Serve that snapshot to the browser half. Deliberately read-only, no secrets
+  // (host/port/flags only), loopback-only, and composed only when a web server
+  // exists — a headless run simply has none.
+  ctx.inject(['webServer'], (wctx) => {
+    // No type augmentation for this service is available here (the plugin does not
+    // depend on the web-server package), so the shape is declared locally.
+    const web = (wctx as unknown as {
+      webServer: {
+        register(route: {
+          kind: 'exact' | 'prefix'
+          path: string
+          handler: (req: any, res: any) => void
+        }): unknown
+      }
+    }).webServer
+    web.register({
+      kind: 'exact',
+      path: '/dsh-proxy/status',
+      handler: (req: any, res: any) => {
+        const remote = String(req?.socket?.remoteAddress ?? '')
+        const loopback = remote === '::1' || remote === '::ffff:127.0.0.1' || remote.startsWith('127.')
+        if (!loopback) {
+          res.statusCode = 403
+          res.end('forbidden')
+          return
+        }
+        res.statusCode = 200
+        res.setHeader?.('content-type', 'application/json')
+        res.setHeader?.('cache-control', 'no-store')
+        res.end(JSON.stringify(statusSnapshot()))
+      },
+    })
+  })
+
+  // A waterfall listener wraps every streaming model call and rewrites the terminal
+  // failure of a suspect tunnel in Chinese (see decorateTunnelFailures). Optional:
+  // a composition without the llm runtime simply never emits this.
+  const waterfalls = ctx as unknown as {
+    on?: (event: string, listener: (...args: unknown[]) => unknown) => unknown
+  }
+  waterfalls.on?.('llm/stream', (...args: unknown[]) => {
+    const next = args[args.length - 1]
+    if (typeof next !== 'function') return undefined
+    return decorateTunnelFailures((next as () => AsyncIterable<any>)())
+  })
+
   events.on?.('dispose', () => {
     disposed = true
     if (timer !== undefined) clearInterval(timer)

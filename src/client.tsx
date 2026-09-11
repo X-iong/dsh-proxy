@@ -23,7 +23,7 @@ const NS = 'dsh-proxy'
  * Bump this when the stylesheet changes: the tag is installed once per page and
  * a stale tag would otherwise keep winning after a client-half reload.
  */
-const CSS_TAG = 'dsh-proxy/ProxyCard.module.css?v2'
+const CSS_TAG = 'dsh-proxy/ProxyCard.module.css?v3'
 
 /**
  * The card chrome mirrors the built-in plugin cards in
@@ -71,6 +71,10 @@ const CSS = `
 .dsh-proxy-save{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3)}
 .dsh-proxy-discard:disabled,.dsh-proxy-save:disabled{opacity:.4;cursor:default}
 .dsh-proxy-discard:focus-visible,.dsh-proxy-save:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dsh-proxy-warn{flex:none;border:0.5px solid var(--dsw-alias-label-error);border-radius:999px;padding:1px 8px;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-error)}
+.dsh-proxy-status{display:flex;flex-direction:column;gap:4px;padding:12px 0 0}
+.dsh-proxy-status-line{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
+.dsh-proxy-status-warn{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-error)}
 `
 
 function ensureCss(): void {
@@ -379,6 +383,66 @@ interface ProxyCardProps {
   discard: () => void
 }
 
+/** The host half's read-only runtime readout (see its `/dsh-proxy/status` route). */
+interface RuntimeStatus {
+  enabled?: boolean
+  host?: string
+  port?: number
+  routing?: string
+  tunnel?: string
+  tunnelBrokenAt?: number | null
+  upstreamFailures?: number
+  probeUrl?: string
+}
+
+const STATUS_POLL_MS = 3000
+
+/**
+ * Poll the host's status route. Under policy B a broken tunnel reroutes nothing,
+ * so this readout is how the verdict becomes visible without reading the log.
+ * A missing route (headless, or an older host half) just leaves the line blank.
+ */
+function useRuntimeStatus(): RuntimeStatus | undefined {
+  const [status, setStatus] = React.useState<RuntimeStatus | undefined>(undefined)
+  React.useEffect(() => {
+    let live = true
+    const read = async () => {
+      try {
+        const response = await fetch('/dsh-proxy/status', { cache: 'no-store' })
+        if (!live) return
+        setStatus(response.ok ? (await response.json()) as RuntimeStatus : undefined)
+      } catch {
+        if (live) setStatus(undefined)
+      }
+    }
+    void read()
+    const id = setInterval(() => { void read() }, STATUS_POLL_MS)
+    return () => { live = false; clearInterval(id) }
+  }, [])
+  return status
+}
+
+const ROUTING_TEXT: Record<string, string> = {
+  proxy: '走代理',
+  direct: '直连（代理端口不可达）',
+  disabled: '未启用',
+  starting: '正在判定…',
+}
+
+/** One line per fact, warning-toned when the tunnel is down. */
+function statusLines(status: RuntimeStatus | undefined): Array<{ warn: boolean; text: string }> {
+  if (status === undefined) return [{ warn: false, text: '宿主状态：暂不可读' }]
+  const routing = String(status.routing ?? '')
+  const lines = [{ warn: false, text: `路由：${ROUTING_TEXT[routing] ?? (routing === '' ? '未知' : routing)}` }]
+  if (status.tunnel === 'broken') {
+    const at = typeof status.tunnelBrokenAt === 'number' ? new Date(status.tunnelBrokenAt).toLocaleTimeString() : '刚才'
+    lines.push({ warn: true, text: `隧道异常：代理节点不可达（${at} 起）。请切换节点，或关闭代理改走直连。` })
+  } else {
+    lines.push({ warn: false, text: '隧道：正常' })
+  }
+  return lines
+}
+
 /**
  * The plugin's card. Collapsed by default, like every peer card in the list.
  *
@@ -392,6 +456,7 @@ function ProxyCard(props: ProxyCardProps) {
   const [open, setOpen] = React.useState(false)
   const saveStarted = React.useRef(false)
   const state = props.useProxyCard((snapshot) => snapshot)
+  const status = useRuntimeStatus()
 
   // Collapse only after the write settles cleanly; a rejected save keeps its
   // diagnostics and staged drafts visible for correction.
@@ -428,6 +493,9 @@ function ProxyCard(props: ProxyCardProps) {
             '自定义 HTTP 代理：让 DSH 宿主进程的全部 fetch（LLM 请求、模型发现、市场、web 搜索）经代理出站。',
           ),
         ]),
+        status?.tunnel === 'broken'
+          ? h('span', { key: 'warn', className: 'dsh-proxy-warn' }, '隧道异常')
+          : null,
         state.dirty ? h('span', { key: 'pending', className: 'dsh-proxy-pending' }, '未保存') : null,
         h(Chevron, { key: 'chevron', open }),
       ],
@@ -437,6 +505,13 @@ function ProxyCard(props: ProxyCardProps) {
           !state.available
             ? h('p', { key: 'ro', className: 'dsh-proxy-readonly', role: 'status' }, '设置尚未就绪，暂时只读。')
             : null,
+          h(
+            'div',
+            { key: 'status', className: 'dsh-proxy-status' },
+            statusLines(status).map((line, index) =>
+              h('p', { key: index, className: line.warn ? 'dsh-proxy-status-warn' : 'dsh-proxy-status-line' }, line.text),
+            ),
+          ),
           h('label', { key: 'enabled', className: 'dsh-proxy-toggle' }, [
             h('input', {
               key: 'box',
