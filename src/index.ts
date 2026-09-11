@@ -61,6 +61,10 @@ const RESET_INTERVAL_MS = 60000
 const UPSTREAM_PROBE_EVERY = 3
 /** Debounce window for reactive rebuilds so a burst of failures triggers one rebuild. */
 const REBUILD_DEBOUNCE_MS = 60
+/** Ceiling for the exponential rebuild backoff, so a sustained burst cannot rebuild on every failure. */
+const REBUILD_BACKOFF_MAX_MS = 5000
+/** Consecutive upstream-probe failures after which the tunnel counts as unhealthy. */
+const UPSTREAM_FAIL_THRESHOLD = 1
 
 function normalizeHostname(rawHost: string): string {
   const host = rawHost.trim().toLowerCase()
@@ -228,6 +232,20 @@ export function apply(ctx: Context, config: ProxyConfig) {
   let current = () => config
   /** Whether the configured proxy port is currently reachable. */
   let alive = false
+  /**
+   * Whether the upstream tunnel is believed healthy. Optimistic: a reachable
+   * port is not proof that traffic flows, so the tunnel is tried and only
+   * demoted after UPSTREAM_FAIL_THRESHOLD consecutive probe failures.
+   */
+  let upstreamHealthy = true
+  /** Consecutive upstream-probe failures; any successful probe resets it. */
+  let upstreamFailures = 0
+  /** Routing mode of the installed dispatcher (undefined while none is installed). */
+  let mode: 'proxy' | 'direct' | undefined
+  /** Backoff window currently enforced between reactive rebuilds. */
+  let rebuildBackoffMs = REBUILD_DEBOUNCE_MS
+  /** When the last rebuild happened, measured against rebuildBackoffMs. */
+  let lastRebuildAt = 0
   let probing = false
   let disposed = false
   let timer: ReturnType<typeof setInterval> | undefined
@@ -236,10 +254,30 @@ export function apply(ctx: Context, config: ProxyConfig) {
   let probeCounter = 0
   const isAutoReset = () => current().autoReset !== false
 
+  /**
+   * The routing decision, in one place: the proxy is used only while the port is
+   * reachable AND the tunnel is healthy. A reachable port with an unhealthy
+   * tunnel degrades to direct, and the upstream probe keeps running, which is
+   * what lets the proxy come back on its own.
+   */
+  const shouldUseProxy = () => alive && upstreamHealthy
+
+  /**
+   * Record the routing mode and emit exactly one structurally stable line per
+   * real switch, e.g. `dsh-proxy: mode proxy→direct reason=upstream-unreachable failures=2`.
+   */
+  const setMode = (useProxy: boolean, reason: string) => {
+    const next = useProxy ? 'proxy' : 'direct'
+    if (mode === next) return
+    logger.info(`dsh-proxy: mode ${mode ?? 'none'}→${next} reason=${reason}`)
+    mode = next
+  }
+
   const uninstall = (reason: string) => {
     if (installed === undefined) return
     const active = installed
     installed = undefined
+    mode = undefined
     setGlobalDispatcher(previous)
     active.close().catch((error) => logger.warn('closing dispatcher failed:', error))
     logger.info(`custom proxy disabled (${reason}); restored the previous global dispatcher`)
@@ -251,7 +289,12 @@ export function apply(ctx: Context, config: ProxyConfig) {
     return new RoutedDispatcher(proxyUrl, noProxy, useProxy, onTransportError)
   }
 
-  const install = (rawConfig: ProxyConfig, useProxy: boolean) => {
+  const install = (rawConfig: ProxyConfig, useProxy: boolean, reason: string) => {
+    // A probe that was already in flight when the plugin unloaded can still
+    // resolve here. Installing then would re-publish a dispatcher and log a
+    // transition *after* disposal, so the global state must stay as dispose left
+    // it. (`rebuild` already guards this; `install` is the path that missed it.)
+    if (disposed) return
     if (rawConfig.enabled === false) {
       uninstall('enabled = false')
       return
@@ -259,16 +302,21 @@ export function apply(ctx: Context, config: ProxyConfig) {
     if (installed !== undefined) {
       // Config changed while active: swap atomically so in-flight requests
       // keep their dispatcher while new ones pick up the new settings.
+      const previousMode = mode
       uninstall('reconfiguring')
+      // A reconfigure is one atomic swap, not a fall back to "no dispatcher":
+      // restoring the mode keeps the transition line below for real changes only.
+      mode = previousMode
     }
     installed = buildDispatcher(rawConfig, useProxy)
     setGlobalDispatcher(installed)
+    setMode(useProxy, reason)
     logger.info(`${useProxy ? 'custom proxy active: host-side fetch traffic routes via' : 'custom proxy direct: host-side fetch traffic goes direct'}` +
       `${useProxy ? ' ' + proxyUrlOf(rawConfig) : ''}` +
       ((rawConfig.noProxy?.length as number) > 0 ? ` (bypass: ${(rawConfig.noProxy as string[]).join(', ')})` : ''))
   }
 
-  const installDirect = (rawConfig: ProxyConfig) => install(rawConfig, false)
+  const installDirect = (rawConfig: ProxyConfig, reason: string) => install(rawConfig, false, reason)
 
   /**
    * Swap the global dispatcher to a brand-new RoutedDispatcher and retire the
@@ -280,23 +328,32 @@ export function apply(ctx: Context, config: ProxyConfig) {
     if (disposed || installed === undefined) return
     const cfg = current()
     if (cfg.enabled === false) return
-    const useProxy = alive
+    const useProxy = shouldUseProxy()
     const old = installed
     const fresh = buildDispatcher(cfg, useProxy)
     installed = fresh
     setGlobalDispatcher(fresh)
+    lastRebuildAt = Date.now()
     const retire = forceful ? old.destroy() : old.close()
     retire.catch((error) => logger.warn('retiring old dispatcher failed:', error))
     logger.info(`connection pool rebuilt (${reason}${forceful ? ', forceful' : ''})`)
   }
 
-  /** Debounced reactive reset: a burst of transport failures triggers one rebuild. */
+  /** Debounced, backed-off reactive reset: a burst of transport failures triggers one rebuild. */
   const scheduleRebuild = (error: any) => {
     if (!isAutoReset() || disposed || installed === undefined) return
+    // Only while traffic really goes through the proxy: a plain network error on
+    // the direct path (bypass-listed host, or a degraded tunnel) must not churn
+    // the proxy connection pool.
+    if (!shouldUseProxy()) return
     if (resetPending) return
+    // Exponential backoff on top of the debounce, so a sustained burst cannot
+    // destroy the pool on every single failure.
+    if (Date.now() - lastRebuildAt < rebuildBackoffMs) return
     resetPending = true
     setTimeout(() => {
       resetPending = false
+      rebuildBackoffMs = Math.min(rebuildBackoffMs * 2, REBUILD_BACKOFF_MAX_MS)
       rebuild(`transport error: ${error?.code ?? error?.message ?? 'unknown'}`, true)
     }, REBUILD_DEBOUNCE_MS)
   }
@@ -342,26 +399,57 @@ export function apply(ctx: Context, config: ProxyConfig) {
       }
       const host = connectHost(cfg)
       const port = cfg.port ?? 7890
-      const ok = await probeProxy(host, port, PROBE_TIMEOUT_MS)
-      if (ok !== alive) {
-        alive = ok
-        logger.info(ok
+      const reachable = await probeProxy(host, port, PROBE_TIMEOUT_MS)
+      if (reachable !== alive) {
+        alive = reachable
+        logger.info(reachable
           ? `dsh-proxy: proxy reachable at ${host}:${port} — routing through it`
           : `dsh-proxy: proxy unreachable at ${host}:${port} — falling back to direct`)
-        if (ok) install(cfg, true)
-        else installDirect(cfg)
-      } else if (installed === undefined) {
-        if (ok) install(cfg, true)
-        else installDirect(cfg)
       }
-      // Upstream probe (every N-th cycle), only while routed through the proxy.
+      if (!reachable) {
+        // The port is gone, so the tunnel verdict goes with it: the next time
+        // the port answers it is tried as a proxy before it is judged.
+        upstreamHealthy = true
+        upstreamFailures = 0
+      }
+      // Decision table (see shouldUseProxy): proxy only while the port answers
+      // and the tunnel is healthy; a reachable port with a dead tunnel degrades
+      // to direct instead of staying on it.
+      const useProxy = shouldUseProxy()
+      if (installed === undefined || mode !== (useProxy ? 'proxy' : 'direct')) {
+        if (useProxy) install(cfg, true, 'port-reachable')
+        else installDirect(cfg, reachable ? 'upstream-unreachable' : 'port-unreachable')
+      }
+      // Upstream probe (every N-th cycle), gated only on the port being
+      // reachable — NOT on the routing mode, so a degraded tunnel keeps being
+      // probed and can come back on its own.
       if (alive && isAutoReset() && installed !== undefined) {
         probeCounter += 1
-        if (probeCounter % UPSTREAM_PROBE_EVERY === 0) {
+        // Every N-th cycle normally; every cycle while the tunnel is degraded, so
+        // recovery does not have to wait for a whole probe interval.
+        const dueUpstream = probeCounter % UPSTREAM_PROBE_EVERY === 0 || !upstreamHealthy
+        if (dueUpstream) {
           const up = await probeUpstream(cfg)
-          if (!up) {
-            logger.warn('dsh-proxy: upstream probe failed — rebuilding connection pool')
-            rebuild('upstream probe failed', true)
+          // Disposal may have landed while the probe was in flight; stop rather
+          // than acting on a verdict about an endpoint this fiber no longer owns.
+          if (disposed) return
+          if (up) {
+            upstreamHealthy = true
+            upstreamFailures = 0
+            rebuildBackoffMs = REBUILD_DEBOUNCE_MS
+            if (mode !== 'proxy') install(cfg, true, 'upstream-recovered')
+          } else {
+            upstreamFailures += 1
+            if (upstreamHealthy) {
+              logger.warn('dsh-proxy: upstream probe failed — rebuilding connection pool')
+              rebuild('upstream probe failed', true)
+              if (upstreamFailures >= UPSTREAM_FAIL_THRESHOLD) {
+                upstreamHealthy = false
+                // Degrade for real. The probe above keeps running, so the next
+                // successful upstream probe switches straight back to proxy.
+                installDirect(cfg, `upstream-unreachable failures=${upstreamFailures}`)
+              }
+            }
           }
         }
       }
@@ -369,7 +457,9 @@ export function apply(ctx: Context, config: ProxyConfig) {
       logger.warn('dsh-proxy: proxy probe failed:', error)
       if (alive) {
         alive = false
-        installDirect(current())
+        upstreamHealthy = true
+        upstreamFailures = 0
+        installDirect(current(), 'port-unreachable')
       }
     } finally {
       probing = false
@@ -379,7 +469,7 @@ export function apply(ctx: Context, config: ProxyConfig) {
   // Start direct (no proxy interception of the TLS path) so a restart while the
   // proxy is down never strands the process; the probe flips to proxy once the
   // port answers. With enabled=false this is a no-op and nothing is installed.
-  installDirect(current())
+  installDirect(current(), 'startup')
   void probe()
   timer = setInterval(() => void probe(), PROBE_INTERVAL_MS)
   if (RESET_INTERVAL_MS > 0) {
@@ -401,8 +491,11 @@ export function apply(ctx: Context, config: ProxyConfig) {
         try {
           // host/port/enabled/autoReset/probeUrl may have changed:
           // drop to direct, then re-probe immediately against the new settings.
+          // The tunnel verdict belongs to the old endpoint, so it is reset too.
           alive = false
-          installDirect(current())
+          upstreamHealthy = true
+          upstreamFailures = 0
+          installDirect(current(), 'reconfigured')
           void probe()
         } catch (error) {
           logger.error('dsh-proxy: keeping the previous dispatcher after a refused update')
