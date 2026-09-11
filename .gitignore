@@ -1,5 +1,6 @@
 node_modules/
 lib/
+_baseline/
 *.tgz
 .DS_Store
 Thumbs.db

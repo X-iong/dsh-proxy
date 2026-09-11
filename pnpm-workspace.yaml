@@ -1,0 +1,21 @@
+# pnpm settings for this package (see also .npmrc).
+#
+# esbuild ships its platform binary through a postinstall script; pnpm >= 10
+# blocks dependency build scripts unless they are explicitly allowed here.
+allowBuilds:
+  esbuild: true
+
+# This host applies a non-zero minimum release age by default; a pinned
+# lockfile entry that is younger than the cutoff would otherwise make every
+# `pnpm install` (including the one pnpm runs before `pnpm run`) fail. The
+# dependency set here is fully pinned by pnpm-lock.yaml, so opt out explicitly.
+minimumReleaseAge: 0
+
+# The @deepseek-ai harness packages are published as `-rc` prereleases whose
+# manifests carry peer ranges such as `^0.1.5`, which semver refuses to satisfy
+# with `0.1.5-rc.2`. Nothing here needs them at runtime — TypeScript resolves
+# their *types* through the `paths` map in tsconfig.build.json, against the
+# already-built workspace copies on this machine — so pnpm must not try to
+# install the graph.
+autoInstallPeers: false
+strictPeerDependencies: false

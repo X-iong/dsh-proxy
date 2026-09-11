@@ -1,5 +1,18 @@
 import * as React from 'react'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+
+/**
+ * Minimal snapshot store used by the card: the runtime's `createSnapshotStore`
+ * is small enough to keep local so the bundle has no extra module dependency.
+ */
+function createSnapshotStore<T>(initial: T) {
+  let value = initial
+  const listeners = new Set<() => void>()
+  return {
+    getSnapshot: () => value,
+    subscribe: (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    set: (next: T) => { value = next; for (const fn of listeners) fn(); },
+  }
+}
 
 const { createElement: h } = React
 
@@ -24,6 +37,15 @@ const CSS = `
 .dsh-proxy-actions button[data-primary=true]{background:var(--dsw-alias-state-business-primary);border-color:transparent;color:#fff}
 .dsh-proxy-actions button:disabled{opacity:.5;cursor:default}
 .dsh-proxy-status{font-size:12px;color:var(--dsw-alias-label-tertiary);margin-right:auto}
+.dsh-proxy-trigger{display:flex;align-items:center;gap:6px;font:inherit;font-size:13px;padding:6px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-background-primary);color:inherit;cursor:pointer;line-height:1}
+.dsh-proxy-trigger:hover{background:var(--dsw-alias-background-secondary,#00000014)}
+.dsh-proxy-trigger[data-active=true]{border-color:var(--dsw-alias-state-business-primary)}
+.dsh-proxy-trigger-icon{font-size:14px;line-height:1}
+.dsh-proxy-overlay{position:fixed;left:16px;bottom:64px;z-index:1000;pointer-events:auto;width:340px;max-width:calc(100vw - 32px)}
+.dsh-proxy-overlay-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border:1px solid var(--dsw-alias-border-l2);border-bottom:none;border-radius:8px 8px 0 0;background:var(--dsw-alias-background-primary)}
+.dsh-proxy-overlay-header .t{margin:0;font-size:13px;font-weight:600}
+.dsh-proxy-overlay-header button{font:inherit;font-size:12px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:inherit;cursor:pointer}
+.dsh-proxy-overlay .dsh-proxy-card{border-radius:0 0 8px 8px;max-width:none}
 `
 
 function ensureCss(): void {
@@ -373,6 +395,63 @@ function ProxyCard(props: ProxyCardProps) {
   ])
 }
 
+/** Shared open/closed state for the footer trigger and the overlay panel. */
+let openState = false
+const openListeners = new Set<() => void>()
+const openStore = {
+  get: () => openState,
+  set: (v: boolean) => {
+    openState = v
+    openListeners.forEach((l) => l())
+  },
+  subscribe: (l: () => void) => {
+    openListeners.add(l)
+    return () => {
+      openListeners.delete(l)
+    }
+  },
+}
+
+function useOpen(): boolean {
+  const [, force] = React.useState(0)
+  React.useEffect(() => openStore.subscribe(() => force((x) => x + 1)), [])
+  return openStore.get()
+}
+
+interface FooterTriggerProps {
+  wide?: boolean
+}
+
+function FooterTrigger(props: FooterTriggerProps) {
+  ensureCss()
+  const open = useOpen()
+  const wide = props.wide !== false
+  return h('button', {
+    type: 'button',
+    className: 'dsh-proxy-trigger',
+    'data-active': open ? true : undefined,
+    title: 'dsh-proxy',
+    'aria-label': 'dsh-proxy',
+    onClick: () => openStore.set(!open),
+  }, [
+    h('span', { key: 'icon', className: 'dsh-proxy-trigger-icon' }, '🌐'),
+    wide ? h('span', { key: 'label' }, 'dsh-proxy') : null,
+  ])
+}
+
+function OverlayPanel(props: ProxyCardProps) {
+  ensureCss()
+  const open = useOpen()
+  if (!open) return null
+  return h('div', { className: 'dsh-proxy-overlay' }, [
+    h('div', { key: 'header', className: 'dsh-proxy-overlay-header' }, [
+      h('span', { key: 't', className: 't' }, 'dsh-proxy 管理'),
+      h('button', { key: 'close', type: 'button', onClick: () => openStore.set(false) }, '关闭'),
+    ]),
+    h(ProxyCard, props),
+  ])
+}
+
 export const name = 'dsh-proxy-client'
 /** Required services (cordis fiber inject) — service names, not package names. */
 export const inject = ['settingsScope', 'slots']
@@ -395,6 +474,28 @@ export function apply(ctx: ClientContext): void {
         inject: () => controller.inject(),
       },
       ProxyCard,
+    )
+  })
+  ctx.slots.inject('sidebar.footer.action', function* () {
+    yield ctx.slots.register(
+      {
+        name: 'sidebar.footer.action',
+        id: 'dsh-proxy',
+        order: 0,
+        label: 'dsh-proxy',
+      },
+      FooterTrigger,
+    )
+  })
+  ctx.slots.inject('shell.overlay', function* () {
+    yield ctx.slots.register(
+      {
+        name: 'shell.overlay',
+        id: 'dsh-proxy-panel',
+        order: 10,
+        inject: () => controller.inject(),
+      },
+      OverlayPanel,
     )
   })
 }

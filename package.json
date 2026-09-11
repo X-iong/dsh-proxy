@@ -42,12 +42,9 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ],
-      "platform": "web"
+      "inject": ["settingsScope", "slots"],
+      "platform": "web",
+      "immediately": true
     }
   },
   "engines": {
@@ -72,9 +69,11 @@
     "undici": "^7.0.0"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-client-runtime": "0.1.1-rc.2",
     "@types/node": "^24.0.0",
     "@types/react": "~18.3.1",
     "esbuild": "^0.28.2",
+    "react": "18.3.1",
     "typescript": "^5.6.0"
   },
   "scripts": {
