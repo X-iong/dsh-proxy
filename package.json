@@ -1,6 +1,6 @@
 {
   "name": "dsh-proxy",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Custom HTTP/HTTPS proxy for DeepSeek Harness: routes every host-side fetch (LLM requests, model discovery, market, web search) through your proxy (Clash/mihomo/v2ray) without TUN mode, with a settings card for live host/port edits. 为 DeepSeek Harness 注入自定义 HTTP 代理，无需 TUN 模式，设置页可直接修改地址与端口。",
   "keywords": [
     "dsh",

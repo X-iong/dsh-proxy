@@ -174,20 +174,19 @@ function wrapHandler(
  * connection and then resets when the request arrives, so the connector's callback
  * SUCCEEDS (`err == null`) and the failure only surfaces later. A "slow down after a
  * failed dial" rule therefore never fires — measured: the plugin still made 11,282
- * connections in 3 s with such a rule, versus 15 with an unconditional one.
+ * connections in 3 s with such a rule, versus 8 with an unconditional one.
  *
- * What it costs in the healthy case: dials for one origin are spaced by
- * `minIntervalMs`, but connections are pooled and reused, so only a burst (a fresh
- * agent after the 60 s pool rebuild, or several origins at once) pays the spacing —
- * a handful of dials over a few hundred milliseconds. The failing case goes from
- * thousands of dials per second to five.
+ * Routing is unchanged: traffic still goes through the proxy (policy B never abandons
+ * the tunnel on its own, and pacing is not a routing decision), and the failure is
+ * still the proxy's own transport error — so the TRANSPORT classification, the retry
+ * policy, and the Chinese diagnostics are all untouched.
  *
- * Routing is unchanged: traffic still goes through the proxy (policy B never
- * abandons the tunnel), and the failure is still the proxy's own transport error,
- * so the TRANSPORT classification, retry policy, and Chinese diagnostics are
- * untouched.
+ * What it costs in the healthy case: only the SECOND and later dials of a burst wait
+ * (the first dial is always immediate, so a single connection is never delayed), and
+ * connections are pooled and reused — measured at 1 connection / 14 ms / 200 OK.
+ * The failing case goes from thousands of dials per second to under three.
  */
-const PROXY_DIAL_INTERVAL_MS = 200
+const PROXY_DIAL_INTERVAL_MS = 400
 
 /**
  * Wrap a connector so consecutive dials are spaced by at least `minIntervalMs`.
