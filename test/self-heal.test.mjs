@@ -63,6 +63,9 @@ async function fakeProxy(port) {
       state.requests += 1
       if (state.mode === 'healthy') {
         socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok')
+      } else if (state.mode === 'silent') {
+        // Accept and never answer, so the probe blocks until its own timeout —
+        // the only way a test can close the port while a probe is truly in flight.
       } else {
         // Malformed status line -> immediate protocol error, no retry storm.
         // Deliberately `write`, not `end`: half-closing leaves a socket undici
@@ -236,5 +239,33 @@ test('a closed proxy port falls back to direct and reports port-unreachable', as
   assert.ok(
     hasTransition('proxy→direct reason=port-unreachable'),
     'a closed port must be reported as port-unreachable, not upstream-unreachable',
+  )
+})
+
+test('a port that vanishes mid-probe is not reported as a broken node', async (t) => {
+  const port = 7915
+  const proxy = await fakeProxy(port)
+  t.after(() => proxy.close())
+  const { lines } = boot(t, { port, probeUrl: PROBE_URL })
+
+  await waitFor(() => modeOf() === 'proxy', 5000, 'mode to become proxy')
+
+  // Stop answering so the next upstream probe blocks on its own timeout, then pull
+  // the port out from under it. Observed in a real run (2026-09-12 18:01:21): the
+  // port disappeared, the plugin correctly went direct, and a stale in-flight probe
+  // finished 3 ms later and announced "代理节点不可达" — naming the wrong cause.
+  proxy.state.mode = 'silent'
+  await sleep(400)
+  assert.equal(modeOf(), 'proxy', 'the tunnel still looks usable until the port actually goes')
+  await proxy.close()
+  await waitFor(() => modeOf() === 'direct', 5000, 'fall back to direct once the port closes')
+
+  // Let the stale probe reach its timeout and be discarded.
+  await sleep(3500)
+  const lied = lines.filter((line) => line.includes('隧道坏了'))
+  assert.deepEqual(
+    lied,
+    [],
+    `a vanished port must not be reported as a broken node, got ${JSON.stringify(lines)}`,
   )
 })

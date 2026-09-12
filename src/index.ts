@@ -630,6 +630,13 @@ export function apply(ctx: Context, config: ProxyConfig) {
       // Disposal may have landed while the probe was in flight; stop rather than
       // acting on a verdict about an endpoint this fiber no longer owns.
       if (disposed) return
+      // The port may also have vanished while we waited. The verdict then belongs
+      // to an endpoint that is gone: liveness has already reset it and routed
+      // direct, so reporting "the node is unreachable" here would name the wrong
+      // cause — the user turned the VPN off, not the node. Observed 2026-09-12
+      // 18:01:21: the port disappeared, we correctly went direct, and a stale
+      // in-flight probe then re-marked the tunnel broken 3 ms later.
+      if (!alive) return
       if (up) {
         const wasBroken = !upstreamHealthy
         upstreamHealthy = true
