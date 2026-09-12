@@ -553,11 +553,16 @@ export function apply(ctx: Context, config: ProxyConfig) {
     if (!upstreamHealthy) return
     upstreamHealthy = false
     tunnelBrokenAt = Date.now()
+    // Keep the probe URL OUT of the middle of this line. The host log
+    // percent-encodes everything following a bare URL it finds in the text, which
+    // turned the actionable half of this warning into %E8%AF%B7%E5%88%87… and made
+    // it unreadable (observed in a real run, 2026-09-12 17:47). The URL goes last,
+    // where nothing follows it to mangle.
     logger.warn(
-      `dsh-proxy: 隧道坏了（代理节点不可达）——上游探测 ${upstreamFailures} 次连续失败`
-      + `（目标 ${current().probeUrl ?? DEFAULT_PROBE_URL}）。`
+      `dsh-proxy: 隧道坏了（代理节点不可达）——上游探测 ${upstreamFailures} 次连续失败。`
       + '请切换到可用节点，或关闭代理改走直连。按当前设置插件不会自动改走直连。',
     )
+    logger.warn(`dsh-proxy: 探测目标 ${current().probeUrl ?? DEFAULT_PROBE_URL}`)
   }
 
   /**

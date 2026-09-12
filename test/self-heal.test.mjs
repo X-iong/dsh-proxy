@@ -168,6 +168,14 @@ test('a failing upstream probe reports the tunnel broken WITHOUT leaving the pro
     lines.some((line) => line.includes('关闭代理改走直连')),
     'the warning must tell the user what to do',
   )
+  // Regression: the warning once embedded the probe URL mid-sentence, and the host
+  // log percent-encodes everything after a bare URL — turning "请切换到可用节点…"
+  // into %E8%AF%B7… in a real run (2026-09-12 17:47). The URL now gets its own line.
+  const warning = lines.find((line) => line.includes('隧道坏了')) ?? ''
+  assert.ok(
+    !/https?:\/\//.test(warning),
+    `the warning must not embed a bare URL (got: ${warning})`,
+  )
   assert.ok(lines.some((line) => line.includes('upstream probe failed')), 'the verdict must come from a failed upstream probe')
 
   // Healed tunnel: the verdict clears and routing never moved.
