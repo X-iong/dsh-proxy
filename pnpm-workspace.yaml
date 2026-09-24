@@ -11,11 +11,10 @@ allowBuilds:
 # dependency set here is fully pinned by pnpm-lock.yaml, so opt out explicitly.
 minimumReleaseAge: 0
 
-# The @deepseek-ai harness packages are published as `-rc` prereleases whose
-# manifests carry peer ranges such as `^0.1.5`, which semver refuses to satisfy
-# with `0.1.5-rc.2`. Nothing here needs them at runtime — TypeScript resolves
-# their *types* through the `paths` map in tsconfig.build.json, against the
-# already-built workspace copies on this machine — so pnpm must not try to
-# install the graph.
+# The @deepseek-ai harness packages are published as `-rc` prereleases, and the
+# same release is referenced across several manifests with ranges such as
+# `^0.1.5` that semver will not satisfy with `0.1.5-rc.2`. The dependencies this
+# package actually builds against are declared explicitly in devDependencies and
+# pinned exactly; pnpm must not try to fill in the rest of the harness graph.
 autoInstallPeers: false
 strictPeerDependencies: false

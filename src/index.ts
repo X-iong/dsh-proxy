@@ -1,6 +1,5 @@
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
-import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { connect, type Socket } from 'node:net'
 import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import {
@@ -18,6 +17,13 @@ export const inject = {}
 /** Settings namespace this plugin owns; the browser card pairs with it. */
 export const NS = 'dsh-proxy'
 
+/**
+ * Resolved, plain configuration — what this plugin actually works with.
+ *
+ * Callers never hand this around as a live object: `current()` builds a fresh
+ * snapshot from the schema's volatile references, so every field it yields is
+ * the value that stands at that instant.
+ */
 export interface ProxyConfig {
   enabled?: boolean
   host?: string
@@ -27,26 +33,100 @@ export interface ProxyConfig {
   probeUrl?: string
 }
 
+/**
+ * The slice of the harness's `Volatile<T>` config reference this plugin reads.
+ * Declared structurally so the plugin takes no runtime or type dependency on
+ * the shared library that defines it.
+ */
+export interface VolatileRef<T> {
+  /** @returns the current immutable snapshot of the reference. */
+  get(): T
+}
+
+/**
+ * One field as it arrives on the parsed config: a volatile reference (how the
+ * harness always hands config to a plugin) or a plain value (how the tests and
+ * a hand-built config call this module).
+ */
+export type ConfigField<T> = VolatileRef<T> | T | undefined
+
+/** The parsed config object `apply` receives from the Loader. */
+export interface ProxyConfigRaw {
+  enabled?: ConfigField<boolean>
+  host?: ConfigField<string>
+  port?: ConfigField<number>
+  noProxy?: ConfigField<string[]>
+  autoReset?: ConfigField<boolean>
+  probeUrl?: ConfigField<string>
+}
+
+/**
+ * Read one field, whether it arrived as a volatile reference or plainly.
+ *
+ * A volatile reference is a live cell the Loader commits new values into
+ * without remounting this plugin, so it must be read at use time and never
+ * cached; `undefined` from an absent reference falls back to the default.
+ */
+export function readField<T>(field: ConfigField<T>, fallback: T): T {
+  if (field === undefined || field === null) return fallback
+  const ref = field as VolatileRef<T>
+  if (typeof ref.get === 'function') return ref.get() ?? fallback
+  return field as T
+}
+
+/**
+ * Snapshot the whole config. Every field is volatile, so the result is a plain
+ * value that the network layer can hold without observing later edits.
+ */
+export function readConfig(raw: ProxyConfigRaw | undefined): ProxyConfig {
+  return {
+    enabled: readField(raw?.enabled, true),
+    host: readField(raw?.host, '127.0.0.1'),
+    port: readField(raw?.port, 7890),
+    noProxy: readField(raw?.noProxy, DEFAULT_NO_PROXY),
+    autoReset: readField(raw?.autoReset, true),
+    probeUrl: readField(raw?.probeUrl, DEFAULT_PROBE_URL),
+  }
+}
+
+/**
+ * Every field is `.volatile()`.
+ *
+ * The harness exposes exactly the fields its settings form may edit: a field
+ * whose schema node is not volatile is ordinary composition configuration, is
+ * invisible to the form, and can only change by rewriting the profile patch and
+ * restarting the entry. Marking the whole schema volatile is what makes the
+ * card on the Plugins page able to write a new host or port that the running
+ * plugin picks up immediately — the Loader commits the new value into the
+ * reference in place (no remount) and emits `loader/volatile-update`, which is
+ * what this plugin listens for.
+ */
 export const Config = Schema.object({
   enabled: Schema.boolean()
     .default(true)
-    .description('启用自定义代理。关闭后恢复 DSH 宿主进程原来的网络方式。'),
+    .description('启用自定义代理。关闭后恢复 DSH 宿主进程原来的网络方式。')
+    .volatile(),
   host: Schema.string()
     .default('127.0.0.1')
-    .description('代理服务器地址，例如 127.0.0.1（Clash/mihomo 本机混合端口）。'),
+    .description('代理服务器地址，例如 127.0.0.1（Clash/mihomo 本机混合端口）。')
+    .volatile(),
   port: Schema.natural()
     .max(65535)
     .default(7890)
-    .description('代理服务器端口，例如 7890（Clash/mihomo 混合端口）。'),
+    .description('代理服务器端口，例如 7890（Clash/mihomo 混合端口）。')
+    .volatile(),
   noProxy: Schema.array(String)
     .default(['localhost', '127.0.0.1', '::1', '[::1]'])
-    .description('绕过代理的主机名单：精确匹配主机名，或以 . 开头匹配域名后缀（如 .lan）。'),
+    .description('绕过代理的主机名单：精确匹配主机名，或以 . 开头匹配域名后缀（如 .lan）。')
+    .volatile(),
   autoReset: Schema.boolean()
     .default(true)
-    .description('自动重建连接池：检测到上游断开或请求发生传输层错误时，销毁并重建连接池，避免复用失效连接。'),
+    .description('自动重建连接池：检测到上游断开或请求发生传输层错误时，销毁并重建连接池，避免复用失效连接。')
+    .volatile(),
   probeUrl: Schema.string()
     .default('https://api.deepseek.com/models')
-    .description('上游连通性探测地址：插件会定期用这个地址发起真实请求（穿过代理）来判断代理上游隧道是否可用。'),
+    .description('上游连通性探测地址：插件会定期用这个地址发起真实请求（穿过代理）来判断代理上游隧道是否可用。')
+    .volatile(),
 })
 
 const DEFAULT_NO_PROXY = ['localhost', '127.0.0.1', '::1', '[::1]']
@@ -271,7 +351,31 @@ class RoutedDispatcher extends Dispatcher {
   }
 }
 
-export function apply(ctx: Context, config: ProxyConfig) {
+/**
+ * Whether two config snapshots need a different dispatcher: the endpoint moved
+ * (host/port), the bypass list changed, or a behaviour flag flipped.
+ *
+ * Compared field by field against the schema defaults rather than by object
+ * identity, because every read rebuilds the snapshot.
+ * @param left - the config the running dispatcher was built from.
+ * @param right - the config that stands now.
+ * @returns whether the installed dispatcher must be replaced.
+ */
+export function configDiffers(left: ProxyConfig, right: ProxyConfig): boolean {
+  const sameList = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean => {
+    const x = a ?? DEFAULT_NO_PROXY
+    const y = b ?? DEFAULT_NO_PROXY
+    return x.length === y.length && x.every((entry, index) => entry === y[index])
+  }
+  return (left.enabled ?? true) !== (right.enabled ?? true)
+    || (left.host ?? '127.0.0.1') !== (right.host ?? '127.0.0.1')
+    || (left.port ?? 7890) !== (right.port ?? 7890)
+    || (left.autoReset ?? true) !== (right.autoReset ?? true)
+    || (left.probeUrl ?? DEFAULT_PROBE_URL) !== (right.probeUrl ?? DEFAULT_PROBE_URL)
+    || !sameList(left.noProxy, right.noProxy)
+}
+
+export function apply(ctx: Context, rawConfig: ProxyConfigRaw) {
   const logger = ctx.logger(name)
 
   // Snapshot the dispatcher that was global when the plugin loaded. Restoring
@@ -279,7 +383,20 @@ export function apply(ctx: Context, config: ProxyConfig) {
   // dispatcher on top of ours in between.
   const previous = getGlobalDispatcher()
   let installed: RoutedDispatcher | undefined
-  let current = () => config
+  /**
+   * Live configuration. Rebuilt on every read: each field is a volatile
+   * reference the Loader commits new values into IN PLACE, so caching a
+   * snapshot here would freeze the plugin on whatever stood when it mounted.
+   */
+  let current = () => readConfig(rawConfig)
+  /**
+   * The config the installed dispatcher was built from. Comparing it against a
+   * fresh read is what detects an endpoint move; doing it on the liveness tick
+   * (rather than trusting the update event alone) keeps the plugin correct even
+   * if that notification is never delivered.
+   */
+  let appliedConfig: ProxyConfig | undefined
+
   /** Whether the configured proxy port is currently reachable. */
   let alive = false
   /**
@@ -351,6 +468,7 @@ export function apply(ctx: Context, config: ProxyConfig) {
     const active = installed
     installed = undefined
     mode = undefined
+    appliedConfig = undefined
     setGlobalDispatcher(previous)
     active.close().catch((error) => logger.warn('closing dispatcher failed:', error))
     logger.info(`custom proxy disabled (${reason}); restored the previous global dispatcher`)
@@ -382,6 +500,7 @@ export function apply(ctx: Context, config: ProxyConfig) {
       mode = previousMode
     }
     installed = buildDispatcher(rawConfig, useProxy)
+    appliedConfig = { ...rawConfig }
     setGlobalDispatcher(installed)
     setMode(useProxy, reason)
     logger.info(`${useProxy ? 'custom proxy active: host-side fetch traffic routes via' : 'custom proxy direct: host-side fetch traffic goes direct'}` +
@@ -405,6 +524,7 @@ export function apply(ctx: Context, config: ProxyConfig) {
     const old = installed
     const fresh = buildDispatcher(cfg, useProxy)
     installed = fresh
+    appliedConfig = { ...cfg }
     setGlobalDispatcher(fresh)
     lastRebuildAt = Date.now()
     const retire = forceful ? old.destroy() : old.close()
@@ -631,6 +751,17 @@ export function apply(ctx: Context, config: ProxyConfig) {
         }
         return
       }
+      // The endpoint moved under a running dispatcher (host/port/noProxy/flags
+      // edited on the settings card). Drop to direct first so the reachability
+      // probe below rebuilds from the NEW endpoint, and forget a tunnel verdict
+      // that described the old one. This is the safety net behind the
+      // `loader/volatile-update` listener: config is re-read here on every tick,
+      // so a missed notification delays the switch by one interval, never loses it.
+      if (installed !== undefined && appliedConfig !== undefined && configDiffers(appliedConfig, cfg)) {
+        alive = false
+        clearTunnelVerdict()
+        installDirect(cfg, 'reconfigured')
+      }
       const host = connectHost(cfg)
       const port = cfg.port ?? 7890
       const reachable = await probeProxy(host, port, PROBE_TIMEOUT_MS)
@@ -725,33 +856,64 @@ export function apply(ctx: Context, config: ProxyConfig) {
     }, RESET_INTERVAL_MS)
   }
 
-  // Register the settings namespace so a configuration surface can edit this
-  // section live. Runs only while a settings service is present.
-  ctx.inject(['settings'], (sctx) => {
-    (sctx.settings as SettingsProvider).installSection(ctx, NS, Config, config as any, {
-      setSource: (source: () => ProxyConfig) => {
-        current = source
-      },
-      onChange: () => {
-        try {
-          // host/port/enabled/autoReset/probeUrl may have changed:
-          // drop to direct, then re-probe immediately against the new settings.
-          // The tunnel verdict belongs to the old endpoint, so it is reset too.
-          alive = false
-          clearTunnelVerdict()
-          installDirect(current(), 'reconfigured')
-          void probeLiveness()
-        } catch (error) {
-          logger.error('dsh-proxy: keeping the previous dispatcher after a refused update')
-          logger.error(error)
-        }
-      },
-    })
-  })
-
   const events = ctx as unknown as {
     on?: (event: string, listener: (...args: never[]) => void) => void
   }
+
+  /**
+   * There is no settings-namespace registration to perform any more.
+   *
+   * In this harness a plugin's editable configuration IS its own Loader entry:
+   * the framework derives the form from the exported `Config` schema and writes
+   * edits into the profile patch, keyed by the entry id. So this plugin declares
+   * nothing — it only has to read its volatile references live (see `current`)
+   * and react when the Loader commits new values.
+   *
+   * The browser card addresses this entry by that same row id, which the bundle
+   * patch fixes to `NS`. A composition mounting the plugin under another id
+   * would leave the card silently absent, so name that case in the log.
+   */
+  try {
+    const self = ctx as unknown as {
+      fiber?: unknown
+      loader?: { locate(fiber?: unknown): string | undefined }
+    }
+    const entryId = self.loader?.locate(self.fiber)
+    if (entryId !== undefined && entryId !== NS) {
+      logger.warn(
+        `dsh-proxy: mounted as Loader entry "${entryId}", but its settings card is keyed on "${NS}" — `
+        + `the card will not appear. Mount the plugin with \`id: ${NS}\`.`,
+      )
+    }
+  } catch {
+    /* diagnostics only: a host without a Loader must still load the plugin */
+  }
+
+  /**
+   * React to a live config commit.
+   *
+   * A settings write lands in the profile patch and the Loader commits the new
+   * values into this plugin's volatile references IN PLACE — no remount, no
+   * second `apply`. `loader/volatile-update` is the only signal, and it is
+   * dispatched to this fiber alone. Without it an endpoint move would still be
+   * caught by the liveness tick's drift check, but a tick is up to
+   * PROBE_INTERVAL_MS of traffic still aimed at the old endpoint.
+   */
+  events.on?.('loader/volatile-update', () => {
+    if (disposed) return
+    try {
+      // host/port/enabled/autoReset/probeUrl may have changed: drop to direct,
+      // then re-probe immediately against the new settings. The tunnel verdict
+      // belongs to the old endpoint, so it is reset too.
+      alive = false
+      clearTunnelVerdict()
+      installDirect(current(), 'reconfigured')
+      void probeLiveness()
+    } catch (error) {
+      logger.error('dsh-proxy: keeping the previous dispatcher after a refused update')
+      logger.error(error)
+    }
+  })
 
   /**
    * Read-only status for the settings card. With policy B a broken tunnel changes

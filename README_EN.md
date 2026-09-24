@@ -4,6 +4,18 @@ English | [简体中文](README.md)
 
 **Custom HTTP/HTTPS proxy for DeepSeek Harness** — route every host-side fetch (LLM requests, model discovery, plugin market, web search) through your proxy (Clash / mihomo / v2ray), **without TUN mode** and without relying on the OS system proxy.
 
+## Compatibility (read this first)
+
+| Plugin version | Harness it targets |
+|---|---|
+| **0.3.x** | **0.1.7-rc.1 and newer** |
+| 0.2.x | 0.1.5-rc.2 and older (0.2.8 is the last one, kept on the `v0.2.8` tag) |
+
+Harness 0.1.7 replaced the plugin-configuration mechanism: a plugin no longer registers a settings namespace of its own — the framework **derives the configuration form from the plugin's exported `Config` schema**, and only exposes fields marked `.volatile()`. The browser-side settings service also changed from `settingsScope` to `configForms`, and the configuration entry point moved from Settings → Built-in plugins to the sidebar **Plugins** panel. 0.3.0 is therefore a **breaking adaptation**; the two lines cannot be mixed:
+
+- `0.3.x` on harness 0.1.6 or older: no card appears and nothing is configurable.
+- `0.2.x` on harness 0.1.7-rc.1: the host half throws `installSection is not a function`, and the card never appears.
+
 ## Why
 
 DSH Desktop / Web sends LLM requests from a host Node process via the global `fetch` (undici):
@@ -27,43 +39,48 @@ The plugin runs in the same host Node process as DSH's LLM adapter. On load it:
 1. Saves the current global dispatcher;
 2. Builds a routed dispatcher backed by undici's `ProxyAgent` with a bypass list, and installs it via `setGlobalDispatcher`;
 3. From then on, **every** global fetch in the process (model discovery `GET /models`, OpenAI SDK chat requests, plugin market, web search, …) egresses through the proxy;
-4. Unloading the plugin or flipping the switch in Settings restores the previous dispatcher — no restart needed.
+4. Unloading the plugin, or turning the switch off on the configuration card, restores the previous dispatcher — no restart needed.
 
 The bypass list (`noProxy`) defaults to `localhost`, `127.0.0.1`, `::1`, so loopback requests always go direct.
 
+The plugin also runs two probes continuously and exposes their verdict to the card:
+
+- **Port liveness** (every 10 s): is anything listening on the proxy port? This is the *only* input to the proxy/direct routing decision — no listener (you turned the VPN off) means direct.
+- **End-to-end tunnel probe**: one real `CONNECT` + TLS handshake + HTTP request. A broken tunnel **never** moves traffic to direct on its own; it only tells you — on the card and in the host log, in Chinese — whether the node is down and what to do about it.
+
 ## Install
 
-### Option 1: paste this prompt into a DSH conversation (recommended)
-
-Copy the whole block below and send it to your DSH Agent — it will install and configure the plugin for you:
-
-```text
-Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for DeepSeek Harness):
-1. Run: dsh plugin --profile desktop add github:BuLongY/dsh-proxy
-   (DSH Desktop uses the desktop profile; for a pure web deployment use web instead.
-    If it fails with "another plugin install recovery transaction is pending",
-    rename %APPDATA%\DSH Desktop\plugin-install-recovery\state.json to state.json.bak and retry.
-    If you hit ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED, copy the full allowBuilds key from the error
-    into %UserProfile%\.dsh\profiles\desktop\pnpm-workspace.yaml and retry.)
-2. Remind me to restart DSH Desktop so the plugin loads.
-3. After restart the proxy defaults to 127.0.0.1:7890 (Clash mixed port).
-   If my proxy uses a different host or port, edit it in Settings → Plugins → Plugin configuration → dsh-proxy; saving applies immediately, no restart.
-4. Verify with a provider that needs the proxy (click "Fetch available models").
-```
-
-### Option 2: manual CLI install
-
 ```powershell
-dsh plugin --profile desktop add github:BuLongY/dsh-proxy
+# Web deployment (dsh web)
+dsh plugin --profile web add github:X-iong/dsh-proxy
+
+# DSH Desktop
+dsh plugin --profile desktop add github:X-iong/dsh-proxy
 ```
 
-Then **restart DSH Desktop**. The proxy defaults to `127.0.0.1:7890` (Clash/mihomo mixed port).
+Restart DSH afterwards (`dsh web` for the web deployment, the app for Desktop). The plugin starts enabled on `127.0.0.1:7890` (Clash/mihomo mixed port).
 
-Once published to npm, `dsh plugin --profile desktop add dsh-proxy` also works (no build-allowance step).
+> You can also paste this prompt into a DSH conversation and let the Agent install it for you:
+>
+> ```text
+> Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for DeepSeek Harness):
+> 1. Check my harness version first: dsh --version. Below 0.1.7-rc.1, use the v0.2.8 tag; otherwise use main.
+> 2. Run: dsh plugin --profile web add github:X-iong/dsh-proxy
+>    (Use desktop instead of web for DSH Desktop. If it fails with ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED,
+>     copy the full allowBuilds key from the error into that profile's pnpm-workspace.yaml and retry.)
+> 3. Remind me to restart DSH so the plugin loads.
+> 4. After restart the proxy defaults to 127.0.0.1:7890. If my proxy differs, open the sidebar Plugins panel,
+>    go to the dsh-proxy bundle, and click Configure on the dsh-proxy row; saving applies immediately.
+> 5. Verify with a provider that needs the proxy (click "Fetch available models").
+> ```
 
 ## Configuration
 
-After install, edit in **Settings → Plugins → Plugin configuration → dsh-proxy** (saving applies immediately, no restart):
+**Where: sidebar **Plugins** panel → the `dsh-proxy` bundle → its page → click Configure on the `dsh-proxy` row.**
+
+(Harness 0.1.7 moved plugin configuration pages here; Settings → Built-in plugins is now a read-only inventory.)
+
+Saving applies immediately, with no restart: every field this plugin declares is volatile, so the harness commits new values **in place** into the running plugin and notifies it through the `loader/volatile-update` event, which makes it re-decide routing at once.
 
 | Field | Default | Description |
 |---|---|---|
@@ -71,14 +88,20 @@ After install, edit in **Settings → Plugins → Plugin configuration → dsh-p
 | `host` | `127.0.0.1` | Proxy server host. |
 | `port` | `7890` | Proxy server port (1–65535). |
 | `noProxy` | `localhost, 127.0.0.1, ::1, [::1]` | Bypass list: exact hostnames; leading `.` matches domain suffixes (e.g. `.lan`); `*` bypasses everything. |
+| `autoReset` | `true` | Rebuild the connection pool after a transport-layer error so a dead pooled connection is never reused. |
+| `probeUrl` | `https://api.deepseek.com/models` | Tunnel probe target; the plugin really requests it to decide whether the upstream tunnel works. |
 
-You can also edit the `dsh-proxy` section in `%UserProfile%\.dsh\settings.yaml` directly. HTTP proxies only; for SOCKS5 use Clash/mihomo's mixed port.
+The card also shows the host's read-only verdict: whether traffic currently goes **through the proxy** or **direct**, whether the tunnel is healthy, and since when it has not been.
+
+Values land in the `config` section of this plugin's row in the active profile's `cordis.patch.yml` (harness 0.1.7 no longer uses `~/.dsh/settings.yaml`). HTTP proxies only; for SOCKS5 use Clash/mihomo's mixed port.
+
+> ⚠️ The mount id is **meaningful** — do not change it: `dsh-proxy` is simultaneously the configuration namespace, the entry id the browser half addresses, and half of the configuration card's registration key (`dsh-proxy#dsh-proxy`). Mounting under another id still installs the proxy, but the card will not appear (the host half logs that case explicitly).
 
 ## Verify
 
 1. Make sure Clash/mihomo is running with mixed port 7890;
 2. Open a provider that needs the proxy and click **Fetch available models**;
-3. A populated model list means success. On failure, check the `dsh-proxy` lines in today's log under `%APPDATA%\DSH Desktop\logs\`.
+3. A populated model list means success. On failure, check the `dsh-proxy` lines in the host log — the `dsh web` console for a web deployment, `%APPDATA%\DSH Desktop\logs\` for Desktop.
 
 ## Platform support
 
@@ -99,15 +122,21 @@ A: Yes — every global fetch in the process goes through the proxy. Under Clash
 **Q: SOCKS5?**
 A: Not supported. undici's ProxyAgent only accepts HTTP/HTTPS proxies. Clash/mihomo's mixed port speaks HTTP — use that.
 
+**Q: The configuration card disappeared after I upgraded my harness?**
+A: Check the version pairing first (see Compatibility above). Harness 0.1.7-rc.1 needs plugin 0.3.x; on 0.2.x the host log reports `installSection is not a function`.
+
 ## Development
 
 ```powershell
-npm install
-npm run build      # tsc -> lib/
-npm test           # node --test test/
+pnpm install
+pnpm build       # tsc -> lib/ plus the bundled browser half lib/client.js
+pnpm test        # node --test test/
+pnpm typecheck   # tsc --noEmit
 # Live test against a real proxy:
-$env:DSH_PROXY_LIVE='1'; npm test
+$env:DSH_PROXY_LIVE='1'; pnpm test
 ```
+
+Development dependencies install the real `@deepseek-ai/*` 0.1.7-rc.1 packages for type checking, and `src/client.tsx` is in `tsconfig.json`'s include list, so the browser half is type-checked too.
 
 ## License
 

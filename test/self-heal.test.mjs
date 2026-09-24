@@ -1,127 +1,13 @@
-// Self-heal behaviour tests for the Phase 2 decision table. Run `pnpm build` first:
-// these import the built artifact in lib/, so a stale lib/ means a stale plugin.
+// Self-heal behaviour tests for the Phase 2 decision table. Run `pnpm build`
+// first: these import the built artifact in lib/, so a stale lib/ means a stale
+// plugin.
 //
-// Design notes (learned the hard way):
-//  * A tunnel failure is simulated by DESTROYING the socket on request, not by
-//    accepting and staying silent. Silence forces the 8s UPSTREAM_TIMEOUT_MS,
-//    which makes the test slow and racy; a reset fails in milliseconds.
-//  * No mock.timers anywhere. Mocking Date freezes Date.now(), which silently
-//    turns any Date.now()-based wait loop into an infinite loop.
-//  * Each test uses its own port and disposes the plugin itself, so a leftover
-//    dispatcher or listener cannot leak into the next test.
+// The fake proxy, the accelerated probe cadence, and the boot harness live in
+// helpers.mjs; the notes there explain why a malformed status line — rather than
+// a silent or resetting socket — is how a test makes a probe fail fast.
 import assert from 'node:assert/strict'
-import { createServer } from 'node:net'
 import { test } from 'node:test'
-import { getGlobalDispatcher } from 'undici'
-import { apply } from '../lib/index.js'
-
-const PROBE_CADENCE_MS = 10000
-const FAST_CADENCE_MS = 30
-
-/** Wall clock the test controls; immune to Date being stubbed by anything. */
-const realNow = () => Number(process.hrtime.bigint() / 1000000n)
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-async function waitFor(predicate, timeoutMs, label) {
-  const started = realNow()
-  while (realNow() - started < timeoutMs) {
-    if (predicate()) return true
-    await sleep(5)
-  }
-  throw new Error(`timed out after ${timeoutMs}ms waiting for: ${label}`)
-}
-
-function modeOf() {
-  const dispatcher = getGlobalDispatcher()
-  if (dispatcher?.useProxy === true) return 'proxy'
-  if (dispatcher?.useProxy === false) return 'direct'
-  return `other(${dispatcher?.constructor?.name})`
-}
-
-/**
- * Fake proxy. `mode` is switched by the test:
- *   'healthy' -> answer every request with a well-formed 200
- *   'dead'    -> answer with a MALFORMED status line, so the probe fails at once
- * The listener itself stays up in both modes, so a spec that degrades while
- * 'dead' is exercising tunnel health and not port liveness.
- *
- * Why malformed instead of "accept and never reply" or "reset the socket":
- * measured against lib/index.js, both of those make undici retry the request in
- * a tight loop until the 8s UPSTREAM_TIMEOUT_MS abort fires (~17k requests to
- * the proxy). A protocol error is not retried: it fails in ~2ms with 1 request.
- * The never-replies case is the realistic one and is covered end-to-end by the
- * scenario harness against the real 8s timeout.
- */
-async function fakeProxy(port) {
-  const state = { mode: 'healthy', requests: 0 }
-  const sockets = new Set()
-  const server = createServer((socket) => {
-    sockets.add(socket)
-    socket.on('close', () => sockets.delete(socket))
-    socket.on('error', () => {})
-    socket.on('data', () => {
-      state.requests += 1
-      if (state.mode === 'healthy') {
-        socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok')
-      } else if (state.mode === 'silent') {
-        // Accept and never answer, so the probe blocks until its own timeout —
-        // the only way a test can close the port while a probe is truly in flight.
-      } else {
-        // Malformed status line -> immediate protocol error, no retry storm.
-        // Deliberately `write`, not `end`: half-closing leaves a socket undici
-        // keeps retrying on, which starves the next (healthy) probe.
-        socket.write('HTTP/1.1 ABC Nope\r\nContent-Length: 2\r\n\r\nok')
-      }
-    })
-  })
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(port, '127.0.0.1', resolve)
-  })
-  return {
-    state,
-    async close() {
-      for (const socket of sockets) socket.destroy()
-      sockets.clear()
-      await new Promise((resolve) => server.close(resolve))
-    },
-  }
-}
-
-/** Boot the plugin with the 10s probe cadence accelerated to FAST_CADENCE_MS. */
-function boot(t, { port, probeUrl }) {
-  const lines = []
-  const logger = {
-    info: (...a) => lines.push(a.map(String).join(' ')),
-    warn: (...a) => lines.push(a.map(String).join(' ')),
-    error: () => {},
-    debug: () => {},
-  }
-  let dispose
-  const ctx = {
-    logger: () => logger,
-    inject: () => {},
-    on: (event, fn) => { if (event === 'dispose') dispose = fn },
-  }
-  const realSetInterval = globalThis.setInterval
-  globalThis.setInterval = (fn, ms) => (ms === PROBE_CADENCE_MS ? realSetInterval(fn, FAST_CADENCE_MS) : realSetInterval(fn, ms))
-  t.after(() => { globalThis.setInterval = realSetInterval })
-  t.after(() => dispose?.())
-
-  apply(ctx, {
-    enabled: true,
-    host: '127.0.0.1',
-    port,
-    noProxy: ['localhost', '127.0.0.1', '::1', '[::1]'],
-    autoReset: true,
-    probeUrl,
-  })
-  return {
-    lines,
-    transitions: () => lines.filter((line) => line.includes('dsh-proxy: mode ')),
-    hasTransition: (needle) => lines.some((line) => line.includes(`dsh-proxy: mode ${needle}`)),
-  }
-}
+import { boot, fakeProxy, modeOf, sleep, waitFor } from './helpers.mjs'
 
 const PROBE_URL = 'http://probe.dsh.invalid/models'
 

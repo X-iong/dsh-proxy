@@ -1,8 +1,18 @@
-// Bundles the browser half into the inertial CJS factory format the DSH
-// client module system expects: window.__ModuleLoader__.load({id, factory}).
-// tsc emits lib/client.js as plain ESM for the types; this script overwrites
-// it with the loadable bundle. Externals resolve through the module system's
-// static table (react) and package rows (@deepseek-ai/dsh-client-runtime).
+// Bundles the browser half into the inertial CJS factory format the DSH client
+// module system expects: window.__ModuleLoader__.load({id, factory}).
+//
+// `id` must be the graph row's id, which is the npm package name — that is how
+// the web shell's module table looks the bundle up.
+//
+// tsc emits lib/client.js as plain ESM for the declarations; this script
+// overwrites it with the loadable bundle.
+//
+// Externals: both specifiers this half requires are part of the client module
+// table's BASELINE seed, which the web shell builds before Cordis exists
+// (react, react/jsx-runtime, react-dom, @deepseek-ai/cordis,
+// @deepseek-ai/dsh-client-store, @deepseek-ai/dsh-client-ui-slots,
+// @deepseek-ai/dsh-client-ui-primitives, @deepseek-ai/dsh-client-ui-dockkit).
+// Nothing here needs a `dsh.client.external` declaration.
 import { build } from 'esbuild'
 import { writeFileSync } from 'node:fs'
 
@@ -12,7 +22,7 @@ const result = await build({
   format: 'cjs',
   platform: 'browser',
   write: false,
-  external: ['react', '@deepseek-ai/dsh-client-runtime/client'],
+  external: ['react', '@deepseek-ai/dsh-client-ui-primitives'],
   logLevel: 'warning',
 })
 

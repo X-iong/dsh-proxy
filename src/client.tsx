@@ -1,386 +1,211 @@
 import * as React from 'react'
+import {
+  SettingsForm,
+  SettingsFormModel,
+  SettingsValueField,
+  settingsNumberField,
+  settingsTextField,
+  type SettingsFieldSpec,
+  type SettingsFieldState,
+  type SettingsFormActions,
+  type SettingsFormScope,
+  type SettingsFormShell,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 
 /**
- * Minimal snapshot store used by the card: the runtime's `createSnapshotStore`
- * is small enough to keep local so the bundle has no extra module dependency.
+ * The plugin's browser half.
+ *
+ * Where the card lives in this harness: the sidebar **Plugins** panel lists the
+ * profile's bundles, and the `dsh-proxy` bundle's own row gains a configure
+ * control that opens this card. The seat is the Plugins page's
+ * `plugins.row.config` slot, keyed `<bundle package name>#<row id>` — registering
+ * into `plugins.item` is reserved for the official host-plane plugins, so a
+ * third-party bundle belongs here.
+ *
+ * How the card reads and writes configuration: the namespace IS this plugin's
+ * Loader entry id, and `ctx.configForms.get(id)` is the shared, revision-fenced
+ * form over it. `SettingsFormModel` stages the user's edits and writes them only
+ * on save; the Host stays the authority on what it accepted, so the form re-seeds
+ * from the accepted section instead of predicting the outcome.
+ *
+ * This half requires no extra module: `react` and
+ * `@deepseek-ai/dsh-client-ui-primitives` are both part of the client module
+ * table's baseline seed, so the bundle requires them by specifier and needs no
+ * `dsh.client.external` entry.
  */
-function createSnapshotStore<T>(initial: T) {
-  let value = initial
-  const listeners = new Set<() => void>()
-  return {
-    getSnapshot: () => value,
-    subscribe: (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn); }; },
-    set: (next: T) => { value = next; for (const fn of listeners) fn(); },
-  }
-}
 
-const { createElement: h } = React
+/** npm package name — half of the `plugins.row.config` registration key. */
+const PKG = 'dsh-proxy'
 
-/** Settings namespace shared with the host half. */
+/**
+ * The Loader row id the bundle patch declares. It is ALSO this entry's settings
+ * namespace (the Host keys config forms by entry id) and the key half the card
+ * registers under, so the three can never disagree. A composition that mounts
+ * the plugin under another id gets no card; the host half logs that case.
+ */
 const NS = 'dsh-proxy'
 
+/** Locale namespace owning this card's copy. */
+const LOCALE_NS = 'dshProxy'
+
+/** How often to re-read the host half's read-only runtime status. */
+const STATUS_POLL_MS = 3000
+
+/** The status route the host half registers (loopback-only, no secrets). */
+const STATUS_PATH = '/dsh-proxy/status'
+
+/** Simplified Chinese copy. */
+const zh = {
+  description: '自定义 HTTP 代理：让 DSH 宿主进程的全部 fetch（LLM 请求、模型发现、市场、web 搜索）经代理出站。',
+  enabled: '启用代理',
+  host: '代理地址',
+  hostHint: '代理服务器地址，例如 127.0.0.1',
+  port: '端口',
+  portHint: '例如 7890',
+  overridden: '已覆盖',
+  reset: '恢复默认',
+  invalidHost: '无效地址',
+  invalidPort: '无效端口',
+  unavailable: '该插件当前未加载，暂时无法配置。',
+  readOnly: '本部署的设置为只读。',
+  save: '保存',
+  saving: '保存中…',
+  saveFailed: '本部署没有接受这些值，已保留供你修改。',
+  statusUnreadable: '宿主状态：暂不可读',
+  routing: '路由：{state}',
+  routingProxy: '走代理',
+  routingDirect: '直连（代理端口不可达）',
+  routingDisabled: '未启用',
+  routingStarting: '正在判定…',
+  routingUnknown: '未知',
+  tunnelOk: '隧道：正常',
+  tunnelBroken: '隧道异常：代理节点不可达（{at} 起）。请切换节点，或关闭代理改走直连。',
+}
+
+/** English copy. */
+const en = {
+  description: 'Custom HTTP proxy: routes every host-side fetch (LLM requests, model discovery, market, web search) through your proxy.',
+  enabled: 'Enable proxy',
+  host: 'Proxy host',
+  hostHint: 'Proxy server address, for example 127.0.0.1',
+  port: 'Port',
+  portHint: 'For example 7890',
+  overridden: 'Overridden',
+  reset: 'Reset to default',
+  invalidHost: 'Not a valid address',
+  invalidPort: 'Not a valid port',
+  unavailable: 'This plugin is not loaded, so it cannot be configured right now.',
+  readOnly: 'This deployment stores settings read-only.',
+  save: 'Save',
+  saving: 'Saving…',
+  saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
+  statusUnreadable: 'Host status: not readable right now',
+  routing: 'Routing: {state}',
+  routingProxy: 'through the proxy',
+  routingDirect: 'direct (proxy port unreachable)',
+  routingDisabled: 'not enabled',
+  routingStarting: 'deciding…',
+  routingUnknown: 'unknown',
+  tunnelOk: 'Tunnel: healthy',
+  tunnelBroken: 'Tunnel broken: the proxy node is unreachable (since {at}). Switch nodes, or turn the proxy off to go direct.',
+}
+
+/** Translate function bound to this card's locale namespace. */
+type Translate = (key: string, params?: Record<string, unknown>) => string
+
+/** The configuration section this card edits. */
+interface ProxySection {
+  enabled?: boolean
+  host?: string
+  port?: number
+}
+
 /**
- * Bump this when the stylesheet changes: the tag is installed once per page and
- * a stale tag would otherwise keep winning after a client-half reload.
+ * A boolean field staged as the draft text `'true'` / `'false'`.
+ *
+ * The shared form model works in draft text so that what the user sees is
+ * exactly what a save would store; a checkbox is just a control that only ever
+ * stages one of these two strings.
+ * @param field - field name inside the namespace section.
+ * @returns the field's conversion spec.
  */
-const CSS_TAG = 'dsh-proxy/ProxyCard.module.css?v3'
-
-/**
- * The card chrome mirrors the built-in plugin cards in
- * `ui-settings-plugins/PluginCard.module.css` (same geometry, palette, and
- * disclosure behaviour) so this card sits in the list as a peer of 终端 /
- * Agent 循环 / Subagent / 网页搜索 rather than as a foreign box. The values are
- * copied deliberately: the section renders its cards inside a `<ul>`, so the
- * root has to be an `<li>` and the header its own button.
- */
-const CSS = `
-.dsh-proxy-card{list-style:none;border:0.5px solid var(--dsw-alias-border-l4);border-radius:16px;background:var(--dsw-alias-bg-layer-3);transition:border-color .16s,background .16s}
-.dsh-proxy-card:hover{border-color:var(--dsw-alias-label-dimmed)}
-.dsh-proxy-card-open{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}
-.dsh-proxy-header{width:100%;appearance:none;border:0;background:none;font:inherit;color:inherit;text-align:left;cursor:pointer;display:flex;align-items:center;gap:12px;padding:14px 16px;border-radius:12px}
-.dsh-proxy-header:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
-.dsh-proxy-headtext{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
-.dsh-proxy-name{font-size:15px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary)}
-.dsh-proxy-desc{font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-.dsh-proxy-pending{flex:none;border:0.5px solid var(--dsw-alias-border-l4);border-radius:999px;padding:1px 8px;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-tertiary)}
-.dsh-proxy-chevron{flex:none;color:var(--dsw-alias-label-tertiary);transition:transform .16s}
-.dsh-proxy-chevron-open{transform:rotate(180deg)}
-.dsh-proxy-body{border-top:0.5px solid var(--dsw-alias-border-l2);margin:0 16px;padding-bottom:8px}
-.dsh-proxy-readonly{margin:12px 0 0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-.dsh-proxy-toggle{display:flex;align-items:center;gap:8px;padding:12px 0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-primary);cursor:pointer}
-.dsh-proxy-toggle input{width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
-.dsh-proxy-row{display:flex;gap:12px;padding:12px 0 0;border-top:0.5px solid var(--dsw-alias-border-l2)}
-.dsh-proxy-row .grow{flex:1;min-width:0}
-.dsh-proxy-field{display:flex;flex-direction:column;gap:6px}
-.dsh-proxy-field-head{display:flex;align-items:center;gap:8px}
-.dsh-proxy-field-label{flex:1;min-width:0;font-size:13px;font-weight:500;line-height:1.5;color:var(--dsw-alias-label-primary)}
-.dsh-proxy-field-reset{border:none;background:none;padding:0;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);cursor:pointer}
-.dsh-proxy-field-reset:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
-.dsh-proxy-field-reset:disabled{cursor:default;opacity:.4}
-.dsh-proxy-input{height:34px;padding:0 12px;border:0.5px solid var(--dsw-alias-border-l4);border-radius:8px;background:var(--dsw-alias-bg-layer-3);font:inherit;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-primary);width:100%;box-sizing:border-box}
-.dsh-proxy-input:focus-visible{outline:none;border-color:var(--dsw-alias-brand-primary)}
-.dsh-proxy-input:disabled{color:var(--dsw-alias-label-tertiary);cursor:default}
-.dsh-proxy-input-invalid{border-color:var(--dsw-alias-label-error)}
-.dsh-proxy-invalid{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-error)}
-.dsh-proxy-hint{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-.dsh-proxy-footer{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 0 4px;border-top:0.5px solid var(--dsw-alias-border-l2)}
-.dsh-proxy-failed{flex:1;min-width:0;margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-error)}
-.dsh-proxy-discard,.dsh-proxy-save{appearance:none;border:1px solid transparent;border-radius:8px;padding:5px 14px;font:inherit;font-size:13px;line-height:1.5;cursor:pointer}
-.dsh-proxy-discard{border-color:var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary)}
-.dsh-proxy-discard:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed)}
-.dsh-proxy-save{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3)}
-.dsh-proxy-discard:disabled,.dsh-proxy-save:disabled{opacity:.4;cursor:default}
-.dsh-proxy-discard:focus-visible,.dsh-proxy-save:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.dsh-proxy-warn{flex:none;border:0.5px solid var(--dsw-alias-label-error);border-radius:999px;padding:1px 8px;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-error)}
-.dsh-proxy-status{display:flex;flex-direction:column;gap:4px;padding:12px 0 0}
-.dsh-proxy-status-line{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}
-.dsh-proxy-status-warn{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-error)}
-`
-
-function ensureCss(): void {
-  if (typeof document === 'undefined') return
-  if (document.querySelector(`style[data-plugin-css="${CSS_TAG}"]`) !== null) return
-  const tag = document.createElement('style')
-  tag.dataset.plugin = 'dsh-proxy'
-  tag.dataset.pluginCss = CSS_TAG
-  tag.textContent = CSS
-  document.head.appendChild(tag)
-}
-
-type Write = { kind: 'set'; value: unknown } | { kind: 'clear' }
-
-interface FieldSpec {
-  field: string
-  format: (value: any) => any
-  parse: (input: any) => Write | undefined
-}
-
-/** A whole-number field; empty draft clears, non-numeric blocks save. */
-function numberField(field: string): FieldSpec {
+function settingsBooleanField(field: string): SettingsFieldSpec {
   return {
     field,
-    format: (value: any) => (typeof value === 'number' ? String(value) : ''),
-    parse: (text: any) => {
-      const trimmed = String(text).trim()
-      if (trimmed === '') return { kind: 'clear' }
-      const parsed = Number(trimmed)
-      return Number.isFinite(parsed) ? { kind: 'set', value: parsed } : undefined
-    },
+    format: (value: unknown) => (value === true ? 'true' : 'false'),
+    parse: (text: string) => (
+      text === 'true' || text === 'false' ? { kind: 'set', value: text === 'true' } : undefined
+    ),
   }
 }
 
-/** A free-text field; empty draft clears. */
-function textField(field: string): FieldSpec {
-  return {
-    field,
-    format: (value: any) => (typeof value === 'string' ? value : ''),
-    parse: (text: any) => {
-      const trimmed = String(text).trim()
-      return trimmed === '' ? { kind: 'clear' } : { kind: 'set', value: trimmed }
-    },
-  }
+/** What the card's component reads. */
+interface CardProjection extends SettingsFormShell {
+  enabled: SettingsFieldState
+  host: SettingsFieldState
+  port: SettingsFieldState
 }
 
-/** A boolean field rendered as a checkbox; drafts are real booleans. */
-function booleanField(field: string): FieldSpec {
-  return {
-    field,
-    format: (value: any) => Boolean(value),
-    parse: (value: any) => ({ kind: 'set', value: Boolean(value) }),
-  }
-}
-
-interface ScopeSnapshot {
-  status: string
-  value?: Record<string, any>
-  base?: Record<string, any>
-  user?: Record<string, any>
-  writable?: boolean
-}
-
-interface SettingsScope {
-  getSnapshot(): ScopeSnapshot
-  subscribe(listener: () => void): unknown
-  set(field: string, value: unknown): Promise<void>
-  unset(field: string): Promise<void>
-}
-
-interface FieldState {
-  value: any
-  overridden: boolean
-  invalid: boolean
-}
-
-interface CardShell {
-  available: boolean
-  writable: boolean
-  dirty: boolean
-  invalid: boolean
-  saving: boolean
-  failed: boolean
-}
-
-interface CardProjection extends CardShell {
-  enabled: FieldState
-  host: FieldState
-  port: FieldState
-}
-
+/** A minimal snapshot store, as the shared form model binds one. */
 interface SnapshotStore<T> {
-  set(value: T): void
+  getSnapshot(): T
+  subscribe(listener: () => void): () => void
 }
 
 /**
- * Staged form over the dsh-proxy settings namespace. Mirrors the CardForm
- * pattern from the built-in settings-plugins package: drafts are staged
- * locally and written only on save, each write fenced by the namespace
- * revision.
+ * The form this card stages over the plugin's own Loader entry.
+ *
+ * One owner for the whole read/write path: the model reads the shared config
+ * form, holds the drafts, and writes every staged edit in one revision-fenced
+ * mutation on save.
  */
 class ProxyCardController {
-  private readonly scope: SettingsScope
-  private readonly specs: Map<string, FieldSpec>
-  private readonly staged = new Map<string, { value: any }>()
-  private readonly listeners = new Set<() => void>()
-  private saving = false
-  private failed = false
+  private readonly form: SettingsFormModel<ProxySection>
+  private readonly store: SnapshotStore<CardProjection>
 
-  constructor(scope: SettingsScope) {
-    this.scope = scope
-    this.specs = new Map<string, FieldSpec>([
-      ['enabled', booleanField('enabled')],
-      ['host', textField('host')],
-      ['port', numberField('port')],
+  /** @param scope - the shared config form for this plugin's entry id. */
+  constructor(scope: SettingsFormScope<ProxySection>) {
+    this.form = new SettingsFormModel<ProxySection>(scope, [
+      settingsBooleanField('enabled'),
+      settingsTextField('host'),
+      settingsNumberField('port'),
     ])
-    scope.subscribe(() => this.publish())
-  }
-
-  bind<T>(project: () => T): SnapshotStore<T> {
-    const store = createSnapshotStore(project()) as SnapshotStore<T>
-    this.listeners.add(() => store.set(project()))
-    return store
-  }
-
-  private publish(): void {
-    for (const listener of this.listeners) listener()
-  }
-
-  private sectionValue(field: string): any {
-    const snapshot = this.scope.getSnapshot()
-    const section = snapshot.status === 'ready' ? snapshot.value : undefined
-    return section?.[field]
-  }
-
-  private baseValue(field: string): any {
-    const snapshot = this.scope.getSnapshot()
-    const base = snapshot.status === 'ready' ? snapshot.base : undefined
-    return base?.[field]
-  }
-
-  private stored(field: string): boolean {
-    const snapshot = this.scope.getSnapshot()
-    const user = snapshot.status === 'ready' ? snapshot.user : undefined
-    return user !== undefined && Object.prototype.hasOwnProperty.call(user, field)
-  }
-
-  private shell(): CardShell {
-    const snapshot = this.scope.getSnapshot()
-    const plan = this.plan()
-    return {
-      available: snapshot.status === 'ready',
-      writable: snapshot.status === 'ready' && snapshot.writable !== false,
-      dirty: plan.length > 0,
-      invalid: plan.some((item) => item.run === undefined),
-      saving: this.saving,
-      failed: this.failed,
-    }
-  }
-
-  private field(field: string): FieldState {
-    const spec = this.specs.get(field)!
-    const staged = this.staged.get(field)
-    if (staged === undefined) {
-      return { value: spec.format(this.sectionValue(field)), overridden: this.stored(field), invalid: false }
-    }
-    const write = spec.parse(staged.value)
-    return { value: staged.value, overridden: write?.kind === 'set', invalid: write === undefined }
-  }
-
-  private plan(): Array<{ field: string; run: Write | undefined }> {
-    const items: Array<{ field: string; run: Write | undefined }> = []
-    for (const [field, staged] of this.staged) {
-      const spec = this.specs.get(field)!
-      items.push({ field, run: spec.parse(staged.value) })
-    }
-    return items
-  }
-
-  actions() {
-    return {
-      edit: (field: string, value: any) => {
-        this.staged.set(field, { value })
-        this.publish()
-      },
-      resetField: (field: string) => {
-        this.staged.set(field, { value: this.specs.get(field)!.format(this.baseValue(field)) })
-        this.publish()
-      },
-      save: () => {
-        void this.save()
-      },
-      discard: () => {
-        this.staged.clear()
-        this.failed = false
-        this.publish()
-      },
-    }
-  }
-
-  private async save(): Promise<void> {
-    if (this.saving) return
-    const plan = this.plan()
-    if (plan.some((item) => item.run === undefined)) return
-    this.saving = true
-    this.failed = false
-    this.publish()
-    try {
-      for (const item of plan) {
-        if (item.run!.kind === 'clear') await this.scope.unset(item.field)
-        else await this.scope.set(item.field, item.run!.value)
-      }
-      this.staged.clear()
-    } catch {
-      this.failed = true
-    } finally {
-      this.saving = false
-      this.publish()
-    }
-  }
-
-  inject() {
-    return { hooks: { proxyCard: this.bind(() => this.projection()) }, ...this.actions() }
+    this.store = this.form.bind(() => this.projection())
   }
 
   private projection(): CardProjection {
     return {
-      ...this.shell(),
-      enabled: this.field('enabled'),
-      host: this.field('host'),
-      port: this.field('port'),
+      ...this.form.shell(),
+      enabled: this.form.field('enabled'),
+      host: this.form.field('host'),
+      port: this.form.field('port'),
     }
+  }
+
+  /**
+   * The business face the slot registration injects: the snapshot the component
+   * selects from, the form's edit/save actions, and the bound translate.
+   * @param t - the card's bound translate function.
+   * @returns the inject face.
+   */
+  inject(t: Translate) {
+    return {
+      hooks: { proxyCard: this.store },
+      ...this.form.actions(),
+      t,
+    }
+  }
+
+  /** Release the accepted-value subscription. */
+  dispose(): void {
+    this.form.dispose()
   }
 }
 
-/** `ic_ds_chevron_down_outline_14` from the client primitives, inlined. */
-const CHEVRON_PATH =
-  'M11.8486 5.5L11.4238 5.92383L8.69727 8.65137C8.44157 8.90706 8.21562 9.13382 8.01172 9.29785C7.79912 9.46883 7.55595 9.61756 7.25 9.66602C7.08435 9.69222 6.91565 9.69222 6.75 9.66602C6.44405 9.61756 6.20088 9.46883 5.98828 9.29785C5.78438 9.13382 5.55843 8.90706 5.30273 8.65137L2.57617 5.92383L2.15137 5.5L3 4.65137L3.42383 5.07617L6.15137 7.80273C6.42595 8.07732C6.59876 8.24849C6.74023 8.3623C6.87291 8.46904C6.92272 8.47813C6.9375 8.48047C6.97895 8.48703C7.02105 8.48703C7.0625 8.48047C7.07728 8.47813C7.12709 8.46904C7.25977 8.3623C7.40124 8.24849C7.57405 8.07732C7.84863 7.80273L10.5762 5.07617L11 4.65137L11.8486 5.5Z'
-
-function Chevron(props: { open: boolean }) {
-  return h(
-    'svg',
-    {
-      className: props.open ? 'dsh-proxy-chevron dsh-proxy-chevron-open' : 'dsh-proxy-chevron',
-      width: 14,
-      height: 14,
-      viewBox: '0 0 14 14',
-      fill: 'none',
-      xmlns: 'http://www.w3.org/2000/svg',
-      'aria-hidden': true,
-      focusable: false,
-    },
-    h('path', { d: CHEVRON_PATH, fill: 'currentColor' }),
-  )
-}
-
-interface FieldProps {
-  id: string
-  label: string
-  hint: string
-  invalidLabel: string
-  value: string
-  invalid: boolean
-  overridden: boolean
-  disabled: boolean
-  placeholder?: string
-  onEdit: (text: string) => void
-  onReset: () => void
-}
-
-function Field(props: FieldProps) {
-  return h('div', { className: 'dsh-proxy-field' }, [
-    h('div', { key: 'head', className: 'dsh-proxy-field-head' }, [
-      h('label', { key: 'label', className: 'dsh-proxy-field-label', htmlFor: props.id }, props.label),
-      props.overridden
-        ? h(
-            'button',
-            { key: 'reset', type: 'button', className: 'dsh-proxy-field-reset', disabled: props.disabled, onClick: props.onReset },
-            '重置',
-          )
-        : null,
-    ]),
-    h('input', {
-      key: 'input',
-      id: props.id,
-      type: 'text',
-      className: props.invalid ? 'dsh-proxy-input dsh-proxy-input-invalid' : 'dsh-proxy-input',
-      value: props.value,
-      placeholder: props.placeholder ?? '',
-      disabled: props.disabled,
-      onChange: (event: any) => props.onEdit(event.target.value),
-    }),
-    h(
-      'p',
-      { key: 'hint', className: props.invalid ? 'dsh-proxy-invalid' : 'dsh-proxy-hint' },
-      props.invalid ? props.invalidLabel : props.hint,
-    ),
-  ])
-}
-
-interface ProxyCardProps {
-  useProxyCard: <T>(selector: (snapshot: CardProjection) => T) => T
-  edit: (field: string, value: any) => void
-  resetField: (field: string) => void
-  save: () => void
-  discard: () => void
+/** One host readout line; warning-toned when the tunnel is down. */
+interface StatusLine {
+  warn: boolean
+  text: string
 }
 
 /** The host half's read-only runtime readout (see its `/dsh-proxy/status` route). */
@@ -395,12 +220,13 @@ interface RuntimeStatus {
   probeUrl?: string
 }
 
-const STATUS_POLL_MS = 3000
-
 /**
- * Poll the host's status route. Under policy B a broken tunnel reroutes nothing,
- * so this readout is how the verdict becomes visible without reading the log.
- * A missing route (headless, or an older host half) just leaves the line blank.
+ * Poll the host's status route.
+ *
+ * A broken tunnel changes no routing (the host half never abandons the tunnel on
+ * its own), so this readout is how that verdict becomes visible without reading
+ * the host log. A missing route simply leaves the lines generic.
+ * @returns the last readable status, or undefined while none is readable.
  */
 function useRuntimeStatus(): RuntimeStatus | undefined {
   const [status, setStatus] = React.useState<RuntimeStatus | undefined>(undefined)
@@ -408,7 +234,7 @@ function useRuntimeStatus(): RuntimeStatus | undefined {
     let live = true
     const read = async () => {
       try {
-        const response = await fetch('/dsh-proxy/status', { cache: 'no-store' })
+        const response = await fetch(STATUS_PATH, { cache: 'no-store' })
         if (!live) return
         setStatus(response.ok ? (await response.json()) as RuntimeStatus : undefined)
       } catch {
@@ -422,190 +248,236 @@ function useRuntimeStatus(): RuntimeStatus | undefined {
   return status
 }
 
-const ROUTING_TEXT: Record<string, string> = {
-  proxy: '走代理',
-  direct: '直连（代理端口不可达）',
-  disabled: '未启用',
-  starting: '正在判定…',
-}
-
-/** One line per fact, warning-toned when the tunnel is down. */
-function statusLines(status: RuntimeStatus | undefined): Array<{ warn: boolean; text: string }> {
-  if (status === undefined) return [{ warn: false, text: '宿主状态：暂不可读' }]
+/**
+ * One line per fact, warning-toned when the tunnel is down.
+ * @param status - the last readable host status.
+ * @param t - the card's bound translate.
+ * @returns the lines to render, in order.
+ */
+function statusLines(status: RuntimeStatus | undefined, t: Translate): StatusLine[] {
+  if (status === undefined) return [{ warn: false, text: t('statusUnreadable') }]
   const routing = String(status.routing ?? '')
-  const lines = [{ warn: false, text: `路由：${ROUTING_TEXT[routing] ?? (routing === '' ? '未知' : routing)}` }]
+  const routingText = routing === 'proxy' ? t('routingProxy')
+    : routing === 'direct' ? t('routingDirect')
+      : routing === 'disabled' ? t('routingDisabled')
+        : routing === 'starting' ? t('routingStarting')
+          : t('routingUnknown')
+  const lines: StatusLine[] = [{ warn: false, text: t('routing', { state: routingText }) }]
   if (status.tunnel === 'broken') {
-    const at = typeof status.tunnelBrokenAt === 'number' ? new Date(status.tunnelBrokenAt).toLocaleTimeString() : '刚才'
-    lines.push({ warn: true, text: `隧道异常：代理节点不可达（${at} 起）。请切换节点，或关闭代理改走直连。` })
+    const at = typeof status.tunnelBrokenAt === 'number'
+      ? new Date(status.tunnelBrokenAt).toLocaleTimeString()
+      : t('routingStarting')
+    lines.push({ warn: true, text: t('tunnelBroken', { at }) })
   } else {
-    lines.push({ warn: false, text: '隧道：正常' })
+    lines.push({ warn: false, text: t('tunnelOk') })
   }
   return lines
 }
 
+/** Inline styling for the readout; the primitives own the form chrome itself. */
+const STATUS_STYLE: React.CSSProperties = {
+  margin: 0,
+  fontSize: 12,
+  lineHeight: 1.5,
+  color: 'var(--dsw-alias-label-tertiary)',
+}
+const STATUS_WARN_STYLE: React.CSSProperties = { ...STATUS_STYLE, color: 'var(--dsw-alias-label-error)' }
+const TOGGLE_STYLE: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '12px 0',
+  fontSize: 13,
+  lineHeight: 1.5,
+  color: 'var(--dsw-alias-label-primary)',
+  cursor: 'pointer',
+}
+
+/** Props a `plugins.row.config` entry receives, plus this card's inject face. */
+interface ProxyCardProps {
+  /** `summary` renders the row's one-liner; `page` renders the form. */
+  view: 'summary' | 'page'
+  useProxyCard: <T>(selector: (snapshot: CardProjection) => T) => T
+  edit: SettingsFormActions['edit']
+  resetField: SettingsFormActions['resetField']
+  save: SettingsFormActions['save']
+  discard: SettingsFormActions['discard']
+  t: Translate
+}
+
 /**
- * The plugin's card. Collapsed by default, like every peer card in the list.
+ * The dsh-proxy configuration card.
  *
- * Unlike the built-in cards this one stays mounted when the namespace is not
- * yet readable — the host half ships in the same package, so the card only
- * exists when the namespace does, and a card that vanished mid-load would take
- * the only proxy control with it. It renders read-only instead.
+ * The Plugins page draws the page chrome (title, crumb, expand/collapse), so
+ * this component owns only the body: the host's read-only status verdict, the
+ * three editable fields, and the save. Leaving the page drops the drafts — the
+ * shared form frame discards on unmount and offers no separate discard control.
+ * @param props - the requested view, the inject face, and the bound translate.
+ * @returns the row's one-liner, or the form body.
  */
 function ProxyCard(props: ProxyCardProps) {
-  ensureCss()
-  const [open, setOpen] = React.useState(false)
-  const saveStarted = React.useRef(false)
+  const { t } = props
   const state = props.useProxyCard((snapshot) => snapshot)
   const status = useRuntimeStatus()
 
-  // Collapse only after the write settles cleanly; a rejected save keeps its
-  // diagnostics and staged drafts visible for correction.
-  React.useEffect(() => {
-    if (state.saving) {
-      saveStarted.current = true
-      return
-    }
-    if (!saveStarted.current) return
-    saveStarted.current = false
-    if (!state.dirty && !state.failed) setOpen(false)
-  }, [state.dirty, state.failed, state.saving])
+  if (props.view === 'summary') return t('description')
 
-  const disabled = !state.writable || state.saving
-  const blocked = !state.dirty || state.invalid || state.saving
-
-  return h('li', { className: open ? 'dsh-proxy-card dsh-proxy-card-open' : 'dsh-proxy-card' }, [
-    h(
-      'button',
-      {
-        key: 'header',
-        type: 'button',
-        className: 'dsh-proxy-header',
-        'aria-expanded': open,
-        'aria-label': `${open ? '收起' : '展开'}: dsh-proxy`,
-        onClick: () => setOpen(!open),
-      },
-      [
-        h('span', { key: 'text', className: 'dsh-proxy-headtext' }, [
-          h('span', { key: 'name', className: 'dsh-proxy-name' }, 'dsh-proxy'),
-          h(
-            'span',
-            { key: 'desc', className: 'dsh-proxy-desc' },
-            '自定义 HTTP 代理：让 DSH 宿主进程的全部 fetch（LLM 请求、模型发现、市场、web 搜索）经代理出站。',
-          ),
-        ]),
-        status?.tunnel === 'broken'
-          ? h('span', { key: 'warn', className: 'dsh-proxy-warn' }, '隧道异常')
-          : null,
-        state.dirty ? h('span', { key: 'pending', className: 'dsh-proxy-pending' }, '未保存') : null,
-        h(Chevron, { key: 'chevron', open }),
-      ],
-    ),
-    open
-      ? h('div', { key: 'body', className: 'dsh-proxy-body' }, [
-          !state.available
-            ? h('p', { key: 'ro', className: 'dsh-proxy-readonly', role: 'status' }, '设置尚未就绪，暂时只读。')
-            : null,
-          h(
-            'div',
-            { key: 'status', className: 'dsh-proxy-status' },
-            statusLines(status).map((line, index) =>
-              h('p', { key: index, className: line.warn ? 'dsh-proxy-status-warn' : 'dsh-proxy-status-line' }, line.text),
-            ),
-          ),
-          h('label', { key: 'enabled', className: 'dsh-proxy-toggle' }, [
-            h('input', {
-              key: 'box',
-              type: 'checkbox',
-              checked: Boolean(state.enabled.value),
-              disabled,
-              onChange: (event: any) => props.edit('enabled', event.target.checked),
-            }),
-            '启用代理',
-          ]),
-          h('div', { key: 'fields', className: 'dsh-proxy-row' }, [
-            h(
-              'div',
-              { key: 'host', className: 'grow' },
-              h(Field, {
-                id: 'dsh-proxy-host',
-                label: '代理地址',
-                hint: '代理服务器地址，例如 127.0.0.1',
-                invalidLabel: '无效地址',
-                value: state.host.value,
-                invalid: state.host.invalid,
-                overridden: state.host.overridden,
-                disabled,
-                onEdit: (text: string) => props.edit('host', text),
-                onReset: () => props.resetField('host'),
-              }),
-            ),
-            h(
-              'div',
-              { key: 'port', style: { width: '160px', flex: 'none' } },
-              h(Field, {
-                id: 'dsh-proxy-port',
-                label: '端口',
-                hint: '例如 7890',
-                invalidLabel: '无效端口',
-                value: state.port.value,
-                invalid: state.port.invalid,
-                overridden: state.port.overridden,
-                disabled,
-                onEdit: (text: string) => props.edit('port', text),
-                onReset: () => props.resetField('port'),
-              }),
-            ),
-          ]),
-          h('div', { key: 'footer', className: 'dsh-proxy-footer' }, [
-            state.failed
-              ? h('p', { key: 'failed', className: 'dsh-proxy-failed', role: 'status' }, '保存被拒绝，请检查值后重试')
-              : null,
-            h(
-              'button',
-              { key: 'discard', type: 'button', className: 'dsh-proxy-discard', disabled: !state.dirty || state.saving, onClick: props.discard },
-              '放弃',
-            ),
-            h(
-              'button',
-              { key: 'save', type: 'button', className: 'dsh-proxy-save', disabled: blocked, onClick: props.save },
-              state.saving ? '保存中…' : '保存',
-            ),
-          ]),
-        ])
-      : null,
-  ])
+  const disabled = !state.writable
+  // `children` rides the props object rather than createElement's third
+  // argument: SettingsFormProps declares it required, and React's typings only
+  // accept the third-argument form for a component whose props make it optional.
+  return React.createElement(SettingsForm, {
+    labels: {
+      unavailable: t('unavailable'),
+      readOnly: t('readOnly'),
+      saveFailed: t('saveFailed'),
+      save: t('save'),
+      saving: t('saving'),
+    },
+    state,
+    onSave: props.save,
+    onDiscard: props.discard,
+    children: [
+      React.createElement(
+        'div',
+        { key: 'status' },
+        statusLines(status, t).map((line, index) =>
+          React.createElement('p', {
+            key: index,
+            style: line.warn ? STATUS_WARN_STYLE : STATUS_STYLE,
+          }, line.text),
+        ),
+      ),
+      React.createElement('label', { key: 'enabled', style: TOGGLE_STYLE }, [
+        React.createElement('input', {
+          key: 'box',
+          type: 'checkbox',
+          checked: state.enabled.text === 'true',
+          disabled,
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+            props.edit('enabled', event.target.checked ? 'true' : 'false')
+          },
+        }),
+        t('enabled'),
+      ]),
+      React.createElement(SettingsValueField, {
+        key: 'host',
+        id: 'dsh-proxy-host',
+        label: t('host'),
+        hint: t('hostHint'),
+        invalidLabel: t('invalidHost'),
+        overriddenLabel: t('overridden'),
+        resetLabel: t('reset'),
+        disabled,
+        text: state.host.text,
+        overridden: state.host.overridden,
+        invalid: state.host.invalid,
+        onEdit: (text: string) => { props.edit('host', text) },
+        onReset: () => { props.resetField('host') },
+      }),
+      React.createElement(SettingsValueField, {
+        key: 'port',
+        id: 'dsh-proxy-port',
+        label: t('port'),
+        hint: t('portHint'),
+        invalidLabel: t('invalidPort'),
+        overriddenLabel: t('overridden'),
+        resetLabel: t('reset'),
+        disabled,
+        numeric: true,
+        text: state.port.text,
+        overridden: state.port.overridden,
+        invalid: state.port.invalid,
+        onEdit: (text: string) => { props.edit('port', text) },
+        onReset: () => { props.resetField('port') },
+      }),
+    ],
+  })
 }
 
-export const name = 'dsh-proxy-client'
-/** Required services (cordis fiber inject) — service names, not package names. */
-export const inject = ['settingsScope', 'slots']
+/** The shared config form for one namespace, as `ctx.configForms.get(id)` returns it. */
+type ConfigFormLike<T> = SettingsFormScope<T>
 
-interface ClientContext {
-  settingsScope: { bind(spec: { namespace: string }): SettingsScope }
-  slots: {
-    inject(name: string, callback: () => Iterable<unknown>): unknown
-    register(entry: Record<string, unknown>, component: unknown): unknown
-  }
+/** The slot registry members this half calls. */
+interface SlotsService {
+  /**
+   * Install an effect for each declaration lifetime of a slot: the callback runs
+   * as soon as the slot is declared, or immediately when it already is.
+   */
+  inject(key: string, callback: () => () => void): () => void
+  /** Contribute a component to a declared slot. */
+  register(options: Record<string, unknown>, component: unknown): () => void
+}
+
+/** The settings forms service members this half calls. */
+interface ConfigFormsService {
+  /** Get the shared form for one Host plugin entry id. */
+  get<T>(entryId: string): ConfigFormLike<T>
+  /** Keep a registration alive while the Host serves any of some namespaces. */
+  whileServed(namespaces: readonly string[], register: (served: ReadonlySet<string>) => () => void): () => void
+}
+
+/** The locale service members this half calls. */
+interface LocaleService {
+  /** Register one namespace's dictionary for one locale. */
+  register(ns: string, locale: string, dict: Record<string, string>): () => void
+  /** Bind a namespace to a translate function reading the active locale at call time. */
+  bind(ns: string): Translate
 }
 
 /**
- * The card is the plugin's only UI surface: it is contributed to the Plugins
- * settings section and owns its own disclosure, exactly like the built-in
- * plugin cards. There is deliberately no separate sidebar entry or floating
- * panel — a second copy of the same form was only a way to get to the first.
+ * The client services this browser half uses.
+ *
+ * Declared structurally with the official contracts as the source of truth —
+ * `slots` is the renderer's `SlotRegistry`, `configForms` is the settings
+ * domain's `ConfigForms`, `locale` is `LocaleRuntime` — naming only the members
+ * this half calls, so the plugin keeps no type dependency on packages it does
+ * not ship with.
+ */
+interface ClientContext {
+  slots: SlotsService
+  configForms: ConfigFormsService
+  locale: LocaleService
+  /** Run a disposer-returning effect on this plugin's fiber. */
+  effect(callback: () => unknown, label?: string): unknown
+}
+
+export const name = 'dsh-proxy-client'
+
+/**
+ * Required services (cordis fiber inject).
+ *
+ * Note that this is the CLIENT half's own declaration, separate from
+ * `package.json.dsh.client.inject` — that field is an informational list of
+ * package-name edges for the boot graph and carries no service meaning.
+ */
+export const inject = ['slots', 'configForms', 'locale']
+
+/**
+ * Mount the configuration card.
+ *
+ * Registration is gated twice, deliberately: `whileServed` keeps the card absent
+ * until the Host actually serves this plugin's entry (so a deployment that never
+ * mounted it shows no trace), and `slots.inject` keeps it absent until the
+ * Plugins page declares the slot (registering into an undeclared slot throws).
+ * @param ctx - the browser plugin context.
  */
 export function apply(ctx: ClientContext): void {
-  const controller = new ProxyCardController(ctx.settingsScope.bind({ namespace: NS }))
-  ctx.slots.inject('settings.plugin.item', function* () {
-    yield ctx.slots.register(
-      {
-        name: 'settings.plugin.item',
-        key: NS,
-        inject: () => controller.inject(),
-      },
-      ProxyCard,
-    )
-  })
+  const t = ctx.locale.bind(LOCALE_NS)
+  ctx.effect(() => ctx.locale.register(LOCALE_NS, 'zh', zh), 'dsh-proxy: Chinese dictionary')
+  ctx.effect(() => ctx.locale.register(LOCALE_NS, 'en', en), 'dsh-proxy: English dictionary')
+
+  const card = new ProxyCardController(ctx.configForms.get<ProxySection>(NS))
+  ctx.effect(() => () => { card.dispose() }, 'dsh-proxy: settings form subscription')
+
+  ctx.effect(
+    () => ctx.configForms.whileServed([NS], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+      name: 'plugins.row.config',
+      key: `${PKG}#${NS}`,
+      inject: () => card.inject(t),
+    }, ProxyCard))),
+    'dsh-proxy: configuration card',
+  )
 }
 
 export default { name, inject, apply }
