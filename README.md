@@ -2,7 +2,9 @@
 
 [English](README_EN.md) | 简体中文
 
-**为 DeepSeek Harness 注入自定义 HTTP 代理** —— 让 DSH 宿主进程的全部 fetch 流量（LLM 请求、模型发现、插件市场、web 搜索）走你指定的代理（Clash / mihomo / v2ray 等），**无需开启 TUN 模式**，也不依赖系统代理。
+**为 DeepSeek Harness 注入自定义 HTTP 代理** —— 让 DSH 宿主进程的全部 fetch 流量（LLM 请求、模型发现、插件市场、web 搜索）走你指定的代理（脉动 / Clash / mihomo / v2ray 等），**无需开启 TUN 模式**，也不依赖系统代理。
+
+> 只要求「一个 HTTP 代理端口」，与客户端品牌无关。Clash、mihomo、v2ray、脉动，以及任何提供 HTTP 代理（含 HTTPS `CONNECT`）的客户端都可以——包括只开「HTTP 代理」而不开 TUN 的部署。SOCKS5-only 的客户端不适用（见文末常见问题）。
 
 ## 兼容性（先看这一节）
 
@@ -27,11 +29,11 @@
 
 DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Node 全局 `fetch`（undici）：
 
-- **不读系统代理**：Windows 设置里的代理、Clash 的"系统代理"开关对它无效。
+- **不读系统代理**：Windows 设置里的代理、客户端自己的「系统代理」开关对它无效。
 - **不读代理环境变量**：`HTTPS_PROXY` 等环境变量对 Node 全局 fetch 无效。
 - **没有内置代理设置**：DSH 的设置界面与提供方配置里都没有代理选项。
 
-于是当某个 API 端点被 Cloudflare 按 IP 拦截（国内宽带段很常见）、或你必须经代理才能访问时，唯一的选择曾是 Clash 的 TUN 模式。本插件提供了另一条路：**在宿主进程内把全局 fetch 的 dispatcher 换成 ProxyAgent**，所有请求经你的代理出站，由 Clash 的规则模式继续负责分流（国内直连、国外走节点），互不冲突。
+于是当某个 API 端点被 Cloudflare 按 IP 拦截（国内宽带段很常见）、或你必须经代理才能访问时，唯一的选择曾是把整个系统塞进 TUN。本插件提供了另一条路：**在宿主进程内把全局 fetch 的 dispatcher 换成 ProxyAgent**，所有请求经你的代理端口出站，客户端自己的规则/分流继续负责国内直连、国外走节点，互不冲突。
 
 ## 效果对比
 
@@ -67,7 +69,7 @@ dsh plugin --profile web add github:X-iong/dsh-proxy
 dsh plugin --profile desktop add github:X-iong/dsh-proxy
 ```
 
-装完需要重启 DSH（Web 端重启 `dsh web`，桌面端重启应用）。插件默认启用 `127.0.0.1:7890`（Clash/mihomo 混合端口）。
+装完需要重启 DSH（Web 端重启 `dsh web`，桌面端重启应用）。插件默认启用 `127.0.0.1:7890`；请填**你的客户端实际监听的 HTTP 代理端口**——脉动、Clash、mihomo 等各家默认端口不同（例如脉动默认 7892、Clash/mihomo 混合端口默认 7890），以客户端界面里的「HTTP 代理端口」为准。
 
 > 也可以把下面这段提示词直接粘贴到 DSH 对话里，让 Agent 代为安装配置：
 >
@@ -78,8 +80,8 @@ dsh plugin --profile desktop add github:X-iong/dsh-proxy
 >    （桌面端把 web 换成 desktop。若提示 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED，
 >     按报错提示把完整的 allowBuilds 键加入对应 profile 的 pnpm-workspace.yaml 后重试。）
 > 3. 安装完成后提醒我重启 DSH 使插件生效。
-> 4. 重启后插件默认代理 127.0.0.1:7890；地址或端口不同的话，在侧边栏「插件」面板里
->    找到 dsh-proxy 这个 bundle，进它的页面，在 dsh-proxy 那一行点「配置」修改，保存即生效、无需重启。
+> 4. 先问我用的代理客户端和它监听的 HTTP 代理端口（不要假定 7890），再在侧边栏「插件」面板里
+>    找到 dsh-proxy 这个 bundle，进它的页面，在 dsh-proxy 那一行点「配置」把 host/port 改成实际值，保存即生效、无需重启。
 > 5. 用一个需要代理的 API 提供方（点"获取可用模型"）验证是否成功。
 > ```
 
@@ -102,13 +104,13 @@ dsh plugin --profile desktop add github:X-iong/dsh-proxy
 
 配置卡上还会显示宿主侧的只读状态：当前是**走代理**还是**直连**、隧道是否正常、以及隧道异常是从什么时候开始的。
 
-配置值最终落在当前 profile 的 `cordis.patch.yml` 里这一行的 `config` 段（0.1.7 起 harness 不再使用 `~/.dsh/settings.yaml`）。仅支持 HTTP 代理；SOCKS5 用户请使用 Clash/mihomo 的混合端口。
+配置值最终落在当前 profile 的 `cordis.patch.yml` 里这一行的 `config` 段（0.1.7 起 harness 不再使用 `~/.dsh/settings.yaml`）。仅支持 HTTP 代理；SOCKS5-only 的客户端请改用其 HTTP 代理端口（多数客户端同时提供，如 Clash/mihomo 的混合端口）。
 
 > ⚠️ 挂载 id 是**有语义的**，不要改：`dsh-proxy` 同时是插件配置的命名空间、浏览器半寻址的 entry id、以及配置卡注册键 `dsh-proxy#dsh-proxy` 的一半。换成别的 id 代理照样工作，但配置卡不会出现（宿主侧日志会明确提示这一点）。
 
 ## 验证
 
-1. 确认 Clash/mihomo 正在运行且混合端口为 7890；
+1. 确认你的代理客户端正在运行，并记下它监听的 HTTP 代理端口（插件里的 `host`/`port` 要与之一致）；
 2. 打开一个需要代理才能访问的 API 提供方配置页，点 **获取可用模型**；
 3. 能拉出模型列表即成功。失败时看宿主日志里 `dsh-proxy` 的行；Web 端是 `dsh web` 的控制台输出，桌面端在 `%APPDATA%\DSH Desktop\logs\` 下当天日志里。
 
@@ -119,17 +121,17 @@ dsh plugin --profile desktop add github:X-iong/dsh-proxy
 
 ## 常见问题
 
-**Q: 开了 Clash 系统代理，为什么 DSH 还是直连？**
+**Q: 客户端开了「系统代理」，为什么 DSH 还是直连？**
 A: 系统代理只对遵循它的应用有效（浏览器等）。DSH 的 LLM 请求在 Node 宿主进程里用 undici fetch 发出，不读系统代理——这正是本插件存在的原因。
 
-**Q: 和 Clash TUN 模式冲突吗？**
-A: 不冲突。两者任选其一即可；同时开也没问题（请求会经代理端口再进 Clash，规则分流依然生效）。
+**Q: 和 TUN 模式冲突吗？**
+A: 不冲突。两者任选其一即可；同时开也没问题（请求会经代理端口再进客户端，规则分流依然生效）。
 
 **Q: 会影响插件市场、web 搜索吗？**
-A: 会——进程内所有全局 fetch 都走代理。在 Clash 规则模式下这正是期望行为：国内站点依然直连。
+A: 会——进程内所有全局 fetch 都走代理。在客户端的规则模式下这正是期望行为：国内站点依然直连。
 
 **Q: 支持 SOCKS5 吗？**
-A: 不支持。undici 的 ProxyAgent 只接受 HTTP/HTTPS 代理。Clash/mihomo 的混合端口同时提供 HTTP 代理能力，填它即可。
+A: 不支持。undici 的 ProxyAgent 只接受 HTTP/HTTPS 代理。请填客户端的 HTTP 代理端口（多数客户端与 SOCKS5 端口并存，Clash/mihomo 的混合端口也同时提供 HTTP）。
 
 **Q: 升级 harness 后配置卡不见了？**
 A: 先核对版本配对（见开头「兼容性」）。0.1.7-rc.1 需要插件 0.3.0/0.3.1；0.1.7-rc.2 需要 0.3.2。若装的是 0.2.x，宿主日志里会有 `installSection is not a function`。

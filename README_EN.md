@@ -2,7 +2,9 @@
 
 English | [简体中文](README.md)
 
-**Custom HTTP/HTTPS proxy for DeepSeek Harness** — route every host-side fetch (LLM requests, model discovery, plugin market, web search) through your proxy (Clash / mihomo / v2ray), **without TUN mode** and without relying on the OS system proxy.
+**Custom HTTP/HTTPS proxy for DeepSeek Harness** — route every host-side fetch (LLM requests, model discovery, plugin market, web search) through your proxy (MaiDong / Clash / mihomo / v2ray / …), **without TUN mode** and without relying on the OS system proxy.
+
+> All it needs is **one HTTP proxy port**; the client brand is irrelevant. Clash, mihomo, v2ray, MaiDong, and anything else exposing an HTTP proxy (including HTTPS `CONNECT`) will do — including a deployment where you enable only the client's HTTP proxy and no TUN. SOCKS5-only clients do not apply (see the FAQ below).
 
 ## Compatibility (read this first)
 
@@ -27,11 +29,11 @@ Harness 0.1.7 replaced the plugin-configuration mechanism: a plugin no longer re
 
 DSH Desktop / Web sends LLM requests from a host Node process via the global `fetch` (undici):
 
-- **Ignores the system proxy**: Windows proxy settings and Clash's "system proxy" toggle have no effect on it.
+- **Ignores the system proxy**: Windows proxy settings and the client's own "system proxy" toggle have no effect on it.
 - **Ignores proxy env vars**: `HTTPS_PROXY` and friends do not affect Node's global fetch.
 - **No built-in proxy setting**: neither DSH Settings nor provider profiles expose one.
 
-So when an API endpoint is blocked by Cloudflare per-IP (common for residential IP ranges), or you simply must egress through a proxy, TUN mode used to be the only answer. This plugin offers another: **swap the global fetch dispatcher for a `ProxyAgent` inside the host process**. All requests egress through your proxy, and Clash's rule mode keeps doing the routing (domestic direct, foreign proxied) — no conflict.
+So when an API endpoint is blocked by Cloudflare per-IP (common for residential IP ranges), or you simply must egress through a proxy, putting the whole system behind a TUN used to be the only answer. This plugin offers another: **swap the global fetch dispatcher for a `ProxyAgent` inside the host process**. All requests egress through your proxy port, and the client's own rules keep doing the routing (domestic direct, foreign proxied) — no conflict.
 
 ## Before / After
 
@@ -67,7 +69,7 @@ dsh plugin --profile web add github:X-iong/dsh-proxy
 dsh plugin --profile desktop add github:X-iong/dsh-proxy
 ```
 
-Restart DSH afterwards (`dsh web` for the web deployment, the app for Desktop). The plugin starts enabled on `127.0.0.1:7890` (Clash/mihomo mixed port).
+Restart DSH afterwards (`dsh web` for the web deployment, the app for Desktop). The plugin starts enabled on `127.0.0.1:7890`; set the **HTTP proxy port your client actually listens on** — defaults differ between clients (MaiDong ships 7892, Clash/mihomo's mixed port is 7890). Take the value from the client's own "HTTP proxy port" setting.
 
 > You can also paste this prompt into a DSH conversation and let the Agent install it for you:
 >
@@ -78,8 +80,9 @@ Restart DSH afterwards (`dsh web` for the web deployment, the app for Desktop). 
 >    (Use desktop instead of web for DSH Desktop. If it fails with ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED,
 >     copy the full allowBuilds key from the error into that profile's pnpm-workspace.yaml and retry.)
 > 3. Remind me to restart DSH so the plugin loads.
-> 4. After restart the proxy defaults to 127.0.0.1:7890. If my proxy differs, open the sidebar Plugins panel,
->    go to the dsh-proxy bundle, and click Configure on the dsh-proxy row; saving applies immediately.
+> 4. Ask me which proxy client I use and which HTTP proxy port it listens on (do not assume 7890), then open the
+>    sidebar Plugins panel, go to the dsh-proxy bundle, and click Configure on the dsh-proxy row to set host/port;
+>    saving applies immediately.
 > 5. Verify with a provider that needs the proxy (click "Fetch available models").
 > ```
 
@@ -102,13 +105,13 @@ Saving applies immediately, with no restart: every field this plugin declares is
 
 The card also shows the host's read-only verdict: whether traffic currently goes **through the proxy** or **direct**, whether the tunnel is healthy, and since when it has not been.
 
-Values land in the `config` section of this plugin's row in the active profile's `cordis.patch.yml` (harness 0.1.7 no longer uses `~/.dsh/settings.yaml`). HTTP proxies only; for SOCKS5 use Clash/mihomo's mixed port.
+Values land in the `config` section of this plugin's row in the active profile's `cordis.patch.yml` (harness 0.1.7 no longer uses `~/.dsh/settings.yaml`). HTTP proxies only; a SOCKS5-only client should be pointed at its HTTP proxy port instead (most clients offer one alongside it, e.g. Clash/mihomo's mixed port).
 
 > ⚠️ The mount id is **meaningful** — do not change it: `dsh-proxy` is simultaneously the configuration namespace, the entry id the browser half addresses, and half of the configuration card's registration key (`dsh-proxy#dsh-proxy`). Mounting under another id still installs the proxy, but the card will not appear (the host half logs that case explicitly).
 
 ## Verify
 
-1. Make sure Clash/mihomo is running with mixed port 7890;
+1. Make sure your proxy client is running, and note the HTTP proxy port it listens on (the plugin's `host`/`port` must match);
 2. Open a provider that needs the proxy and click **Fetch available models**;
 3. A populated model list means success. On failure, check the `dsh-proxy` lines in the host log — the `dsh web` console for a web deployment, `%APPDATA%\DSH Desktop\logs\` for Desktop.
 
@@ -119,17 +122,17 @@ Values land in the `config` section of this plugin's row in the active profile's
 
 ## FAQ
 
-**Q: Clash system proxy is on — why does DSH still connect directly?**
+**Q: The client's "system proxy" is on — why does DSH still connect directly?**
 A: The system proxy only affects apps that honor it (browsers, etc.). DSH's LLM requests are made with undici fetch inside a Node host process, which ignores the system proxy — exactly why this plugin exists.
 
-**Q: Does it conflict with Clash TUN mode?**
-A: No. Use either one; running both is also fine (requests enter Clash via the proxy port and rules still apply).
+**Q: Does it conflict with TUN mode?**
+A: No. Use either one; running both is also fine (requests enter the client via the proxy port and its rules still apply).
 
 **Q: Does it affect the plugin market and web search?**
-A: Yes — every global fetch in the process goes through the proxy. Under Clash rule mode that is the desired behavior: domestic sites stay direct.
+A: Yes — every global fetch in the process goes through the proxy. Under the client's rule mode that is the desired behavior: domestic sites stay direct.
 
 **Q: SOCKS5?**
-A: Not supported. undici's ProxyAgent only accepts HTTP/HTTPS proxies. Clash/mihomo's mixed port speaks HTTP — use that.
+A: Not supported. undici's ProxyAgent only accepts HTTP/HTTPS proxies. Use the client's HTTP proxy port (most clients expose one next to the SOCKS5 port; Clash/mihomo's mixed port speaks HTTP too).
 
 **Q: The configuration card disappeared after I upgraded my harness?**
 A: Check the version pairing first (see Compatibility above). Harness 0.1.7-rc.1 needs plugin 0.3.0/0.3.1; 0.1.7-rc.2 needs 0.3.2. On 0.2.x the host log reports `installSection is not a function`.
