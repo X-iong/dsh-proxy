@@ -127,22 +127,19 @@ test('it registers the third-party configuration seat for its own entry', () => 
   assert.deepEqual(served, [['dsh-proxy']], 'the card appears only while the Host serves this entry')
   assert.deepEqual(
     injected,
-    ['plugins.bundle.config', 'plugins.row.config'],
-    '`plugins.item` is reserved for the official host-plane plugins',
+    ['plugins.bundle.config'],
+    '`plugins.item` is reserved for the official host-plane plugins, and the row seat is not claimed',
   )
   assert.deepEqual(dicts.map((d) => [d.ns, d.locale]), [['dshProxy', 'zh'], ['dshProxy', 'en']])
   assert.deepEqual(Object.keys(dicts[0].dict).sort(), Object.keys(dicts[1].dict).sort(), 'the two dictionaries must stay balanced')
 
-  // BOTH seats, or the user gets no configuration at all: the package detail page
-  // renders its configuration section only when `plugins.bundle.config` has an
-  // occupant for that package name, and `plugins.row.config` belongs to the row's
-  // own page.
+  // Exactly ONE seat: the package page, which is where a user lands and which
+  // renders its configuration section only when this slot has an occupant for
+  // that package name. Claiming the row's seat as well renders the same form a
+  // second time, one navigation deeper.
   assert.deepEqual(
     registered.map(({ options }) => [options.name, options.key]),
-    [
-      ['plugins.bundle.config', 'dsh-proxy'],
-      ['plugins.row.config', 'dsh-proxy#dsh-proxy'],
-    ],
+    [['plugins.bundle.config', 'dsh-proxy']],
   )
   const { options, component } = registered[0]
 
