@@ -1,5 +1,26 @@
 import Schema from '@deepseek-ai/schemastery';
 import type { Context } from '@deepseek-ai/cordis';
+/**
+ * Why this plugin must run on undici 8, and what breaks on 7.
+ *
+ * Node's built-in `fetch` does not own its dispatcher: it reads the
+ * `Symbol.for('undici.globalDispatcher.1')` slot when a request starts. undici 8
+ * keeps that legacy slot working by wrapping whatever is installed in a
+ * `Dispatcher1Wrapper`, which bridges the legacy (`.1`) handler built-in `fetch`
+ * passes down to the modern (`.2`) handler a current undici dispatcher expects.
+ *
+ * An undici 7 dispatcher placed in that slot gets no such bridge, and the
+ * request never completes: the proxy is never dialled and `fetch()` hangs until
+ * its own abort fires. Measured on Node 24.21 with the 0.3.1 build — an undici-7
+ * `ProxyAgent` at the slot produced `TimeoutError` with zero requests reaching
+ * the proxy, while the same test under undici 8 returned the proxied response.
+ * A build like that looks "installed and working": routing decisions, host logs,
+ * and the status card all report success while every request keeps going direct.
+ *
+ * The coupling is on the SLOT, not on an exact version: a dispatcher built by
+ * any undici 8 copy (this plugin's own, or the one the harness ships) is
+ * compatible, because both write `.1` through the same wrapper.
+ */
 export declare const name = "dsh-proxy";
 export declare const inject: {};
 /** Settings namespace this plugin owns; the browser card pairs with it. */

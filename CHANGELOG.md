@@ -1,7 +1,26 @@
 # 更新日志
 
 版本与 harness 的配对关系见 [README「兼容性」](README.md#兼容性先看这一节)。
-简言之：**0.3.x 面向 harness 0.1.7-rc.1 及以上；0.2.x 面向 0.1.6 及更早**，两者不可混用。
+简言之：**0.3.2 面向 harness 0.1.7-rc.2 及以上；0.3.0 / 0.3.1 面向 0.1.7-rc.1；0.2.x 面向 0.1.6 及更早**，不可混用。
+
+## 0.3.2 — 2026-09-24
+
+**破坏性**：适配 DeepSeek Harness **0.1.7-rc.2**。0.3.1 装到 rc.2 上**看起来完全正常**，实际一条请求都不走代理——这是本次修复的核心。
+
+- **宿主半改用 undici 8**（`undici: ^7.0.0` → `^8.10.0`，与 harness 自带的 `dsh-http-proxy` 同一条依赖线）。
+  Node 内置 `fetch` 只认 `Symbol.for('undici.globalDispatcher.1')` 这个插槽，而 undici 8 会把装进该插槽的 dispatcher 包一层 `Dispatcher1Wrapper`，把内置 fetch 传下来的 `.1` handler 桥接成当前 undici 期望的 `.2` handler。undici 7 的 dispatcher 拿不到这层桥接：**请求发到 dispatcher 之后永远不完成**，代理端口一次都不会被拨号，`fetch()` 一直挂到自己的 abort 超时。Node 24.21 实测：把 undici 7 的 `ProxyAgent` 放在该插槽上 → 代理收到 0 个请求、`fetch` 抛 `TimeoutError`；同一测试换成 undici 8 → 正常拿到代理应答。
+  症状的欺骗性在于：路由判定、宿主日志、配置卡状态全部照常上报「走代理」，只有真实流量还在直连。
+- **错误拦截改用 `.2` handler 契约**（`onResponseError(controller, error)`，同时兼容旧的 `onError(error)`）。
+  此前只拦 `onError`，而 undici 8 经 `Dispatcher1Wrapper` 递下来的是 `LegacyHandlerWrapper`——**它根本没有 `onError` 方法**，于是这个 hook 静默失效：线上传输故障不再被观测，连接池不重建，模型报错也不会被改写成中文提示。
+- **错误拦截的转发方式改为「取值 + bind」**（原为 `Object.create` 原型委托）。
+  `LegacyHandlerWrapper` 的方法内部读 `#handler` 私有字段，经派生对象调用会以错误的 receiver 读该私有字段，请求直接死于 `Cannot read private member #handler from an object whose class did not declare it`，用户只看到一个笼统的 `fetch failed`。
+- **`paceDials` 加防御，并把节流上移到 dispatch 层**：`clientFactory` 的 `connect` 在 undici 8 上不再总是函数，缺失时原样放行（否则请求时抛 `connect is not a function`）。但仅放行会让「防重拨风暴」这一保护**静默失效**——它原本包的就是那个 connector。undici 8 改为在 `ProxyAgent` 内部自建 `Http1ProxyWrapper`/`Agent`，connector 不再外露，因此新增 `PaceProxyDials`：在进入代理连接池的那一层把调用按 400ms 间隔排队（窗口开着且队列为空时立即放行，所以单条正常请求不受影响；实测单条 25ms、三条并发间隔 407/406/405ms）。
+- **测试补上真正能发现这个 bug 的一层**：新增 `test/global-fetch.test.mjs` 与 `test/pacing.test.mjs`，前者用**真实 `fetch` + 本地绝对形式代理**断言流量落点，后者按生产探测节奏断言节流。此前 `proxy.test.mjs` 读的是 `getGlobalDispatcher()`（`.2` 插槽），插件写不写都能通过，所以 0.3.1 全绿却完全失效。已 A/B 验证：把 handler 包装换回 0.3.1 写法，线上故障观测会失败；把 undici 换回 7，真实 fetch 会挂死。
+- 依赖与元数据对齐当前 harness：`@deepseek-ai/dsh-client-ui-primitives` 的 peer/dev 由 `0.1.7-rc.1` → `0.1.7-rc.2`（该 peer 参与 harness 的 `evaluatePluginCompatibility` 校验，pin 旧版本会让 profile 直接拒绝加载该 bundle），`engines.dsh` → `>=0.1.7-rc.2`、`engines.node` → `>=22.19`。
+
+### 从 0.3.1 升级
+
+装新版并重启 DSH 即可，配置无需改动。升级后请**用一个必须经代理的 API 提供方点一次「获取可用模型」实测**——0.3.1 的失效表现正是「哪都对，就是不生效」。
 
 ## 0.3.1 — 2026-09-24
 

@@ -8,13 +8,20 @@ English | [简体中文](README.md)
 
 | Plugin version | Harness it targets |
 |---|---|
-| **0.3.x** | **0.1.7-rc.1 and newer** |
+| **0.3.2** | **0.1.7-rc.2 and newer** |
+| 0.3.0 / 0.3.1 | 0.1.7-rc.1 |
 | 0.2.x | 0.1.5-rc.2 and older (0.2.8 is the last one, kept on the `v0.2.8` tag) |
+
+**Mind this table, especially the 0.3.1 → 0.3.2 step.** 0.3.1 on harness 0.1.7-rc.2 reports no error at all: the plugin mounts, the log announces "routing through it", and the configuration card reads "through the proxy" — while **not a single request actually leaves through the proxy**. The slot contract between Node's built-in `fetch` and undici changed; 0.3.2 restores it (see "How it works").
+
+How to tell whether you hit it: before upgrading to 0.3.2, if the log claimed the proxy was active while an endpoint that should have been Cloudflare-blocked still answered 403 (or a request that needs the proxy still went direct), that was this bug.
 
 Harness 0.1.7 replaced the plugin-configuration mechanism: a plugin no longer registers a settings namespace of its own — the framework **derives the configuration form from the plugin's exported `Config` schema**, and only exposes fields marked `.volatile()`. The browser-side settings service also changed from `settingsScope` to `configForms`, and the configuration entry point moved from Settings → Built-in plugins to the sidebar **Plugins** panel. 0.3.0 is therefore a **breaking adaptation**; the two lines cannot be mixed:
 
-- `0.3.x` on harness 0.1.6 or older: no card appears and nothing is configurable.
+- `0.3.2` on harness 0.1.7-rc.1 or older: no card appears and nothing is configurable (the undici slot contract does not match).
 - `0.2.x` on harness 0.1.7-rc.1: the host half throws `installSection is not a function`, and the card never appears.
+
+0.3.2 fixes a second, **silent** failure: the host half moved from undici 7 to undici 8. Node's built-in `fetch` resolves its dispatcher from the cross-version slot `Symbol.for('undici.globalDispatcher.1')`, and undici 8 wraps whatever is installed there in a `Dispatcher1Wrapper` that bridges the legacy (`.1`) handler built-in `fetch` passes down to the modern (`.2`) handler a current dispatcher expects. An undici-7 dispatcher gets no such bridge: the request is handed to the dispatcher and never completes, and the proxy port is never dialled. The same source worked on 0.1.7-rc.1 and failed silently on 0.1.7-rc.2 for exactly this reason.
 
 ## Why
 
@@ -43,6 +50,8 @@ The plugin runs in the same host Node process as DSH's LLM adapter. On load it:
 
 The bypass list (`noProxy`) defaults to `localhost`, `127.0.0.1`, `::1`, so loopback requests always go direct.
 
+> **Why the host half must run on undici 8**: Node's built-in `fetch` does not own its dispatcher — it reads `Symbol.for('undici.globalDispatcher.1')` when a request starts. undici 8 wraps whatever is installed in that slot in a `Dispatcher1Wrapper`, which bridges the legacy (`.1`) handler built-in `fetch` passes down to the modern (`.2`) handler a current undici dispatcher expects. An undici-7 dispatcher gets no such bridge and the request never completes (the proxy port is never dialled). The coupling is on the **slot**, not on an exact version: the plugin's own undici 8 and the copy the harness ships both write that slot compatibly.
+
 The plugin also runs two probes continuously and exposes their verdict to the card:
 
 - **Port liveness** (every 10 s): is anything listening on the proxy port? This is the *only* input to the proxy/direct routing decision — no listener (you turned the VPN off) means direct.
@@ -64,7 +73,7 @@ Restart DSH afterwards (`dsh web` for the web deployment, the app for Desktop). 
 >
 > ```text
 > Please install and enable the dsh-proxy plugin (a custom HTTP proxy plugin for DeepSeek Harness):
-> 1. Check my harness version first: dsh --version. Below 0.1.7-rc.1, use the v0.2.8 tag; otherwise use main.
+> 1. Check my harness version first: dsh --version. Below 0.1.7-rc.1 use the v0.2.8 tag, 0.1.7-rc.1 use the v0.3.1 tag, 0.1.7-rc.2 and newer use main.
 > 2. Run: dsh plugin --profile web add github:X-iong/dsh-proxy
 >    (Use desktop instead of web for DSH Desktop. If it fails with ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED,
 >     copy the full allowBuilds key from the error into that profile's pnpm-workspace.yaml and retry.)
@@ -123,7 +132,10 @@ A: Yes — every global fetch in the process goes through the proxy. Under Clash
 A: Not supported. undici's ProxyAgent only accepts HTTP/HTTPS proxies. Clash/mihomo's mixed port speaks HTTP — use that.
 
 **Q: The configuration card disappeared after I upgraded my harness?**
-A: Check the version pairing first (see Compatibility above). Harness 0.1.7-rc.1 needs plugin 0.3.x; on 0.2.x the host log reports `installSection is not a function`.
+A: Check the version pairing first (see Compatibility above). Harness 0.1.7-rc.1 needs plugin 0.3.0/0.3.1; 0.1.7-rc.2 needs 0.3.2. On 0.2.x the host log reports `installSection is not a function`.
+
+**Q: The log says "routing through it", but requests still go direct / still answer 403?**
+A: That is the signature of 0.3.1 on harness 0.1.7-rc.2 — the host half's undici version no longer matches the dispatcher-slot contract (see "How it works"). Upgrade to 0.3.2, then verify by fetching the model list from a provider that requires the proxy.
 
 ## Development
 
@@ -136,7 +148,9 @@ pnpm typecheck   # tsc --noEmit
 $env:DSH_PROXY_LIVE='1'; pnpm test
 ```
 
-Development dependencies install the real `@deepseek-ai/*` 0.1.7-rc.1 packages for type checking, and `src/client.tsx` is in `tsconfig.json`'s include list, so the browser half is type-checked too.
+Development dependencies install the real `@deepseek-ai/*` 0.1.7-rc.2 packages for type checking, and `src/client.tsx` is in `tsconfig.json`'s include list, so the browser half is type-checked too.
+
+`test/global-fetch.test.mjs` is the one layer that can catch a **silent** host-half failure: it drives a real `fetch` at a loopback absolute-form proxy and asserts the request actually landed there (it also covers the bypass list, wire-failure observation, and the `undici.globalDispatcher.1` slot built-in fetch really reads). `test/pacing.test.mjs` verifies, at the production probe cadence, that calls into the proxy pool are still spaced by 400 ms. Run both after any change to the host half's network layer.
 
 ## License
 

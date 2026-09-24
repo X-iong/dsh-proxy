@@ -11,6 +11,27 @@ import {
   setGlobalDispatcher,
 } from 'undici'
 
+/**
+ * Why this plugin must run on undici 8, and what breaks on 7.
+ *
+ * Node's built-in `fetch` does not own its dispatcher: it reads the
+ * `Symbol.for('undici.globalDispatcher.1')` slot when a request starts. undici 8
+ * keeps that legacy slot working by wrapping whatever is installed in a
+ * `Dispatcher1Wrapper`, which bridges the legacy (`.1`) handler built-in `fetch`
+ * passes down to the modern (`.2`) handler a current undici dispatcher expects.
+ *
+ * An undici 7 dispatcher placed in that slot gets no such bridge, and the
+ * request never completes: the proxy is never dialled and `fetch()` hangs until
+ * its own abort fires. Measured on Node 24.21 with the 0.3.1 build — an undici-7
+ * `ProxyAgent` at the slot produced `TimeoutError` with zero requests reaching
+ * the proxy, while the same test under undici 8 returned the proxied response.
+ * A build like that looks "installed and working": routing decisions, host logs,
+ * and the status card all report success while every request keeps going direct.
+ *
+ * The coupling is on the SLOT, not on an exact version: a dispatcher built by
+ * any undici 8 copy (this plugin's own, or the one the harness ships) is
+ * compatible, because both write `.1` through the same wrapper.
+ */
 export const name = 'dsh-proxy'
 export const inject = {}
 
@@ -225,30 +246,63 @@ function isTransportError(error: any): boolean {
 }
 
 /**
- * Copy a DispatchHandler and intercept onError to report transport failures.
- * Uses prototype delegation so every other handler method forwards untouched.
+ * Intercept a DispatchHandler's failure callback to report transport failures.
+ *
+ * Which callback that is depends on the handler generation undici handed us: the
+ * modern (`.2`) contract reports failure through
+ * `onResponseError(controller, error)` and names no `onError` at all, while the
+ * legacy (`.1`) contract calls `onError(error)`. Both are honoured, so the same
+ * dispatcher serves this harness's `.2` call path (reached through undici 8's
+ * `Dispatcher1Wrapper`) and a direct `.1` caller.
+ *
+ * The returned handler is a plain object holding BOUND references to the
+ * original's methods. Neither prototype delegation (`Object.create`) nor a
+ * `Proxy` works here: the handler undici hands us is a `LegacyHandlerWrapper`
+ * whose methods read a `#handler` private field, and both of those change the
+ * receiver, so `this.#handler` is read off the wrong instance. Measured on Node
+ * 24.21 with undici 8: the request dies with `Cannot read private member #handler
+ * from an object whose class did not declare it`, surfaced to the user as a bare
+ * `fetch failed` in place of the real transport error.
+ * @param handler - the dispatch handler to wrap.
+ * @param onTransportError - called for each failure that looks like a transport failure.
+ * @returns a handler that forwards every call unchanged and observes failures.
  */
 function wrapHandler(
   handler: Dispatcher.DispatchHandler,
   onTransportError: (error: any) => void,
 ): Dispatcher.DispatchHandler {
   if (!handler || typeof handler !== 'object') return handler
-  if (typeof handler.onError !== 'function') return handler
-  const wrapped: any = Object.create(handler)
-  const original: any = handler.onError
-  wrapped.onError = function (error: any) {
+  const modern = typeof (handler as any).onResponseError === 'function'
+  const key = modern
+    ? 'onResponseError'
+    : typeof (handler as any).onError === 'function' ? 'onError' : undefined
+  if (key === undefined) return handler
+  const original = (handler as any)[key] as (...args: any[]) => unknown
+  const wrapped: any = {}
+  for (const own of Object.getOwnPropertyNames(handler)) {
+    const value = (handler as any)[own]
+    wrapped[own] = typeof value === 'function' ? value.bind(handler) : value
+  }
+  // Methods that live on the prototype instead of the instance are not reached
+  // by the own-property pass above; copy the ones any handler generation uses.
+  for (const own of ['onError', 'onResponseError', 'onConnect', 'onHeaders', 'onData',
+    'onComplete', 'onRequestStart', 'onResponseStart', 'onResponseData', 'onResponseEnd']) {
+    if (typeof (handler as any)[own] === 'function') wrapped[own] = (handler as any)[own].bind(handler)
+  }
+  wrapped[key] = (...args: any[]) => {
+    const error = modern ? args[1] : args[0]
     try {
       if (isTransportError(error)) onTransportError(error)
     } catch {
       /* never let the hook break dispatch */
     }
-    return original.call(handler, error)
+    return original.apply(handler, args)
   }
   return wrapped
 }
 
 /**
- * Space out proxy dials, unconditionally.
+ * Space out proxy traffic, unconditionally.
  *
  * Why unconditional: the failure mode this guards is a proxy that ACCEPTS the TCP
  * connection and then resets when the request arrives, so the connector's callback
@@ -261,16 +315,29 @@ function wrapHandler(
  * still the proxy's own transport error — so the TRANSPORT classification, the retry
  * policy, and the Chinese diagnostics are all untouched.
  *
- * What it costs in the healthy case: only the SECOND and later dials of a burst wait
- * (the first dial is always immediate, so a single connection is never delayed), and
- * connections are pooled and reused — measured at 1 connection / 14 ms / 200 OK.
- * The failing case goes from thousands of dials per second to under three.
+ * Where it is enforced, and why that moved: the guard used to wrap the connector
+ * `ProxyAgent` handed to its `clientFactory`. undici 8 stopped passing one, so the
+ * same interval is now enforced one level up, by spacing calls into the proxy pool
+ * ({@link PaceProxyDials}), with the connector wrap kept for any undici that still
+ * supplies it.
+ *
+ * What it costs in the healthy case: a call is forwarded at once whenever the window
+ * is open and nothing is queued, so a single pooled request — the normal case, measured
+ * at 1 connection / 14 ms / 200 OK — is never delayed. Bursts wait their turn; the
+ * failing case goes from thousands of dials per second to under three.
  */
 const PROXY_DIAL_INTERVAL_MS = 400
 
 /**
  * Wrap a connector so consecutive dials are spaced by at least `minIntervalMs`.
- * @param connect - the connector ProxyAgent handed us.
+ *
+ * A missing connector is passed straight through: undici 8 stopped handing the
+ * proxy dial connector to `ProxyAgent.clientFactory` (it builds its own
+ * `Http1ProxyWrapper`/`Agent` internally), so whoever calls this must be ready
+ * for `undefined` rather than turning every dial into
+ * `connect is not a function`. See {@link PaceProxyDials} for the limiter that
+ * took over the job on that undici.
+ * @param connect - the connector ProxyAgent handed us, when it still does.
  * @param minIntervalMs - minimum spacing between dials.
  * @returns a connector with the same contract.
  */
@@ -278,6 +345,7 @@ function paceDials(
   connect: (opts: any, callback: (err: Error | null, socket?: any) => void) => void,
   minIntervalMs: number,
 ): (opts: any, callback: (err: Error | null, socket?: any) => void) => void {
+  if (typeof connect !== 'function') return connect
   let nextAllowedAt = 0
   return (opts, callback) => {
     const now = Date.now()
@@ -289,6 +357,92 @@ function paceDials(
 }
 
 /**
+ * A dispatcher facade that spaces the calls it forwards, one at a time.
+ *
+ * Why this exists on top of {@link paceDials}: undici 8 no longer passes a
+ * connector to `ProxyAgent.clientFactory`, so the connector-level pacing has
+ * nothing to wrap there. Wrapping `dispatch` instead keeps the guard's actual
+ * purpose — a proxy that accepts the connection and then resets must not be
+ * hammered with thousands of re-dials — while staying above the transport
+ * details that moved.
+ *
+ * Delivery is not dropped: when a call would fall inside the spacing window it is
+ * acknowledged (`true`) and the same opts/handler pair is forwarded once the
+ * window opens. A healthy pooled request is usually the only call in flight, so
+ * its dispatch is immediate and unthrottled; bursts — the failing case — are
+ * serialized at `minIntervalMs` apart.
+ */
+class PaceProxyDials extends Dispatcher {
+  /** When the next forward may happen. */
+  private nextAllowedAt = 0
+  /** Calls acknowledged early and waiting for their slot. */
+  private readonly queue: { opts: Dispatcher.DispatchOptions; handler: Dispatcher.DispatchHandler }[] = []
+  private drainTimer: ReturnType<typeof setTimeout> | undefined
+  private closed = false
+
+  /**
+   * @param inner - the dispatcher whose calls are spaced — the proxy pool.
+   * @param minIntervalMs - minimum spacing between consecutive forwarded calls.
+   */
+  constructor(
+    private readonly inner: Dispatcher,
+    private readonly minIntervalMs: number,
+  ) {
+    super()
+  }
+
+  dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+    if (this.closed) return false
+    const now = Date.now()
+    if (this.queue.length === 0 && now >= this.nextAllowedAt) {
+      this.nextAllowedAt = now + this.minIntervalMs
+      return this.inner.dispatch(opts, handler)
+    }
+    this.queue.push({ opts, handler })
+    this.scheduleDrain()
+    return true
+  }
+
+  /** Forward one queued call per spacing window until the queue is empty. */
+  private scheduleDrain(): void {
+    if (this.drainTimer !== undefined || this.closed) return
+    const wait = Math.max(0, this.nextAllowedAt - Date.now())
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = undefined
+      if (this.closed) return
+      const next = this.queue.shift()
+      if (next === undefined) return
+      this.nextAllowedAt = Date.now() + this.minIntervalMs
+      try {
+        this.inner.dispatch(next.opts, next.handler)
+      } catch (error) {
+        // A queued call that cannot be forwarded must still fail loudly for its
+        // caller, in the handler contract's own shape.
+        ;(next.handler as any).onResponseError?.(undefined, error)
+        ;(next.handler as any).onError?.(error)
+      }
+      this.scheduleDrain()
+    }, wait)
+  }
+
+  async close(): Promise<void> {
+    this.closed = true
+    if (this.drainTimer !== undefined) clearTimeout(this.drainTimer)
+    this.drainTimer = undefined
+    this.queue.length = 0
+    return this.inner.close()
+  }
+
+  async destroy(): Promise<void> {
+    this.closed = true
+    if (this.drainTimer !== undefined) clearTimeout(this.drainTimer)
+    this.drainTimer = undefined
+    this.queue.length = 0
+    return this.inner.destroy()
+  }
+}
+
+/**
  * Dispatcher that sends bypass-listed hosts straight out and everything else
  * through the proxy. Both agents use Node's default TLS negotiation (no forced
  * version). The two agents are created lazily and owned by this instance's
@@ -296,7 +450,7 @@ function paceDials(
  */
 class RoutedDispatcher extends Dispatcher {
   private readonly direct: Agent
-  private readonly proxied: ProxyAgent
+  private readonly proxied: PaceProxyDials
   private readonly useProxy: boolean
   private readonly onTransportError: (error: any) => void
 
@@ -310,14 +464,17 @@ class RoutedDispatcher extends Dispatcher {
     this.useProxy = useProxy
     this.onTransportError = onTransportError
     this.direct = new Agent()
-    this.proxied = new ProxyAgent({
+    // `clientFactory(origin, { connect })` is where ProxyAgent exposed the
+    // connector it dials the proxy with in undici 7 — the only place the re-dial
+    // storm could be paced. undici 8 stopped passing that connector, so this
+    // stays for the undici that still does, and the spacing moved up to
+    // `dispatch` (see PaceProxyDials).
+    const pool = new ProxyAgent({
       uri: proxyUrl,
-      // `clientFactory(origin, { connect })` is how ProxyAgent exposes the
-      // connector it dials the proxy with — the only place the re-dial storm can
-      // be paced (see paceFailingDials).
       clientFactory: (origin: any, opts: any) =>
         new Pool(origin, { ...opts, connect: paceDials(opts.connect, PROXY_DIAL_INTERVAL_MS) }),
     })
+    this.proxied = new PaceProxyDials(pool, PROXY_DIAL_INTERVAL_MS)
   }
 
   dispatch(

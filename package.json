@@ -1,6 +1,6 @@
 {
   "name": "dsh-proxy",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Custom HTTP/HTTPS proxy for DeepSeek Harness: routes every host-side fetch (LLM requests, model discovery, market, web search) through your proxy (Clash/mihomo/v2ray) without TUN mode, with a configuration card for live host/port edits. 为 DeepSeek Harness 注入自定义 HTTP 代理，无需 TUN 模式，插件配置页可直接修改地址与端口。",
   "keywords": [
     "dsh",
@@ -52,8 +52,8 @@
     }
   },
   "engines": {
-    "node": ">=20",
-    "dsh": ">=0.1.7-rc.1"
+    "node": ">=22.19",
+    "dsh": ">=0.1.7-rc.2"
   },
   "os": [
     "win32",
@@ -63,16 +63,16 @@
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-rc.2",
     "@deepseek-ai/schemastery": "~3.18.4",
     "react": "^18.2.0"
   },
   "dependencies": {
-    "undici": "^7.0.0"
+    "undici": "^8.10.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
-    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-rc.2",
     "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^24.0.0",
     "@types/react": "~18.3.1",

@@ -8,13 +8,20 @@
 
 | 插件版本 | 适配的 harness |
 |---|---|
-| **0.3.x** | **0.1.7-rc.1 及以上** |
+| **0.3.2** | **0.1.7-rc.2 及以上** |
+| 0.3.0 / 0.3.1 | 0.1.7-rc.1 |
 | 0.2.x | 0.1.5-rc.2 及更早（0.2.8 是最后一个，保留在 `v0.2.8` tag） |
+
+**务必按这一栏配对，尤其是 0.3.1 → 0.3.2 这一档。** 0.3.1 装到 0.1.7-rc.2 上不会报任何错：插件正常挂载、日志照常打印「routing through it」、配置卡状态也显示走代理，但**实际一条请求都不走代理**。原因是 Node 内置 `fetch` 与 undici 之间的插槽契约变了，见下面「工作原理」一节的说明；0.3.2 修掉了它。
+
+判断自己是不是踩了这个坑：升级到 0.3.2 之前，只要「日志说走代理、但某个本该被 Cloudflare 拦的端点仍然 403 / 仍然直连」，就是它。
 
 0.1.7 把插件配置机制整体换了：插件不再自己注册设置命名空间，而是**由框架从插件导出的 `Config` schema 直接生成配置表单**，且只暴露标了 `.volatile()` 的字段；浏览器侧的设置服务也由 `settingsScope` 换成了 `configForms`，配置入口从「设置 → 内置插件」搬到了侧边栏的「插件」面板。因此 0.3.0 是一次**破坏性适配**，不能与 0.2.x 混用：
 
-- 装 `0.3.x` 到 0.1.6 及更早的 harness 上：卡片不出现、配置改不动。
+- 装 `0.3.2` 到 0.1.7-rc.1 或更早的 harness 上：卡片不出现、配置改不动（undici 插槽契约不匹配）。
 - 装 `0.2.x` 到 0.1.7-rc.1 上：宿主侧会抛 `installSection is not a function`，卡片永不出现。
+
+0.3.2 另修了一处**不报错的**失效：宿主半从 undici 7 换到 undici 8。Node 内置 `fetch` 取 dispatcher 走的是 `Symbol.for('undici.globalDispatcher.1')` 这个跨版本插槽，undici 8 会把装进去的 dispatcher 包一层 `Dispatcher1Wrapper`（把内置 fetch 传下来的 `.1` handler 桥接成 `.2` handler），而 undici 7 的 dispatcher 没有这层桥接，结果是请求发下去之后永不完成、代理端口一次都不被拨号。同一份源码在 0.1.7-rc.1 上能用、在 0.1.7-rc.2 上静默失效，差别就在这里。
 
 ## 为什么需要它
 
@@ -43,6 +50,8 @@ DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Nod
 
 绕过名单（`noProxy`）默认包含 `localhost`、`127.0.0.1`、`::1`，本地回环请求永远直连。
 
+> **为什么宿主半必须用 undici 8**：Node 内置 `fetch` 不持有自己的 dispatcher，它在每次请求开始时读 `Symbol.for('undici.globalDispatcher.1')` 这个插槽。undici 8 会把装进该插槽的 dispatcher 包一层 `Dispatcher1Wrapper`，把内置 fetch 传下来的旧式（`.1`）handler 桥接成当前 undici 期望的新式（`.2`）handler；undici 7 的 dispatcher 没有这层桥接，请求会在发到 dispatcher 之后永不完成（代理端口一次都不被拨号）。这个耦合在**插槽**上而不是具体版本号上——插件自带的 undici 8 与 harness 自带的 undici 8 都能写通同一个插槽。
+
 插件还会持续做两项探测，并把结论暴露给配置卡：
 
 - **端口存活探测**（10 秒一次）：代理端口是否在监听。只有它决定"走代理 / 直连"——端口不在（比如你关了 VPN）就走直连。
@@ -64,7 +73,7 @@ dsh plugin --profile desktop add github:X-iong/dsh-proxy
 >
 > ```text
 > 请帮我安装并启用 dsh-proxy 插件（DeepSeek Harness 的自定义 HTTP 代理插件）。步骤：
-> 1. 先确认我的 harness 版本：dsh --version。低于 0.1.7-rc.1 就用 v0.2.8 tag，否则用 main。
+> 1. 先确认我的 harness 版本：dsh --version。低于 0.1.7-rc.1 用 v0.2.8 tag，0.1.7-rc.1 用 v0.3.1 tag，0.1.7-rc.2 及以上用 main。
 > 2. 执行：dsh plugin --profile web add github:X-iong/dsh-proxy
 >    （桌面端把 web 换成 desktop。若提示 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED，
 >     按报错提示把完整的 allowBuilds 键加入对应 profile 的 pnpm-workspace.yaml 后重试。）
@@ -123,7 +132,10 @@ A: 会——进程内所有全局 fetch 都走代理。在 Clash 规则模式下
 A: 不支持。undici 的 ProxyAgent 只接受 HTTP/HTTPS 代理。Clash/mihomo 的混合端口同时提供 HTTP 代理能力，填它即可。
 
 **Q: 升级 harness 后配置卡不见了？**
-A: 先核对版本配对（见开头「兼容性」）。0.1.7-rc.1 需要插件 0.3.x；若装的是 0.2.x，宿主日志里会有 `installSection is not a function`。
+A: 先核对版本配对（见开头「兼容性」）。0.1.7-rc.1 需要插件 0.3.0/0.3.1；0.1.7-rc.2 需要 0.3.2。若装的是 0.2.x，宿主日志里会有 `installSection is not a function`。
+
+**Q: 日志说「routing through it」，但请求还是直连 / 还是 403？**
+A: 这是 0.3.1 装到 harness 0.1.7-rc.2 上的典型症状（宿主半的 undici 版本与该插槽契约不匹配，见「工作原理」）。升到 0.3.2 即可；升级后请用一个必须经代理的 API 提供方点一次「获取可用模型」实测。
 
 ## 开发
 
@@ -136,7 +148,9 @@ pnpm typecheck   # tsc --noEmit
 $env:DSH_PROXY_LIVE='1'; pnpm test
 ```
 
-开发依赖直接安装真实的 `@deepseek-ai/*` 0.1.7-rc.1 包做类型检查；`src/client.tsx` 也在 `tsconfig.json` 的 include 里，所以浏览器半同样会被 `tsc` 检查。
+开发依赖直接安装真实的 `@deepseek-ai/*` 0.1.7-rc.2 包做类型检查；`src/client.tsx` 也在 `tsconfig.json` 的 include 里，所以浏览器半同样会被 `tsc` 检查。
+
+测试里 `test/global-fetch.test.mjs` 是**唯一能发现宿主半静默失效**的那一层：它用真实 `fetch` 打一个本地绝对形式代理，断言请求确实落在代理上（另外还覆盖绕过名单、线上故障观测、以及内置 fetch 实际读取的 `undici.globalDispatcher.1` 插槽）。`test/pacing.test.mjs` 则按生产探测节奏验证进入代理池的调用仍被 400ms 节流。改动宿主半的网络层后请务必都跑。
 
 ## License
 
