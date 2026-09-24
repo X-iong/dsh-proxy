@@ -192,3 +192,48 @@ test('a non-canonical Loader entry id is reported rather than silently losing th
     `a mismatched row id must be named, got ${JSON.stringify(lines)}`,
   )
 })
+
+/**
+ * A web server stand-in that behaves like the real one where it matters:
+ * registering the same (kind, path) twice throws, and only the returned disposer
+ * releases the route. `WebServer.register` is not fiber-scoped, so a plugin that
+ * drops that disposer leaks its route and dies on its next reload.
+ * @returns the live route table and the service to inject.
+ */
+function webHarness() {
+  const routes = new Map()
+  return {
+    routes,
+    webServer: {
+      register(route) {
+        if (routes.has(route.path)) throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
+        routes.set(route.path, route)
+        return () => { routes.delete(route.path) }
+      },
+    },
+  }
+}
+
+test('the status route dies with the plugin, so a reload can claim it again', () => {
+  const harness = webHarness()
+  const mount = () => {
+    const ctx = fakeContext()
+    ctx.inject = (services, callback) => {
+      if (services.includes('webServer')) callback({ webServer: harness.webServer, effect: ctx.effect })
+    }
+    apply(ctx, { enabled: false, host: '127.0.0.1', port: 7890 })
+    return ctx
+  }
+
+  const first = mount()
+  assert.deepEqual([...harness.routes.keys()], ['/dsh-proxy/status'])
+
+  first.emit('dispose')
+  assert.deepEqual([...harness.routes.keys()], [], 'an unloaded plugin must not leave its route behind')
+
+  // Same route table, second mount: this is the reload that used to die on
+  // `webserver: duplicate exact route` because the first mount never released it.
+  const reloaded = mount()
+  assert.deepEqual([...harness.routes.keys()], ['/dsh-proxy/status'])
+  reloaded.emit('dispose')
+})

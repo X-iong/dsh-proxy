@@ -949,10 +949,15 @@ export function apply(ctx: Context, rawConfig: ProxyConfigRaw) {
           kind: 'exact' | 'prefix'
           path: string
           handler: (req: any, res: any) => void
-        }): unknown
+        }): () => void
       }
     }).webServer
-    web.register({
+    // Route registration is NOT fiber-scoped: `WebServer.register` only returns a
+    // disposer, and it throws on a duplicate (kind, path). Registering one without
+    // claiming it on this fiber's effects leaks the route, so the plugin's next
+    // reload — a hot profile recomposition, or disable/enable in the GUI — dies on
+    // `webserver: duplicate exact route "/dsh-proxy/status"`.
+    wctx.effect(() => web.register({
       kind: 'exact',
       path: '/dsh-proxy/status',
       handler: (req: any, res: any) => {
@@ -968,7 +973,7 @@ export function apply(ctx: Context, rawConfig: ProxyConfigRaw) {
         res.setHeader?.('cache-control', 'no-store')
         res.end(JSON.stringify(statusSnapshot()))
       },
-    })
+    }), 'dsh-proxy: status route')
   })
 
   // A waterfall listener wraps every streaming model call and rewrites the terminal

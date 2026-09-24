@@ -120,18 +120,34 @@ export function volatileRef(initial) {
  * `inject` is recorded rather than ignored: the port away from a
  * settings-namespace registration means the plugin must no longer reach for a
  * `settings` service at all, and the test suite asserts that.
+ *
+ * `effect` runs its callback immediately (as cordis does) and keeps the returned
+ * disposer, which `emit('dispose')` releases — so a test can prove that a
+ * resource the plugin claims really dies with the plugin.
  * @returns the fake context plus the recorded state.
  */
 export function fakeContext() {
   const listeners = new Map()
   const injected = []
+  const effectDisposers = []
   return {
     listeners,
     injected,
+    effectDisposers,
     logger: () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {} }),
     on(event, fn) { listeners.set(event, fn) },
-    emit(event, ...args) { listeners.get(event)?.(...args) },
+    emit(event, ...args) {
+      listeners.get(event)?.(...args)
+      if (event !== 'dispose') return
+      for (const dispose of effectDisposers.splice(0)) {
+        if (typeof dispose === 'function') dispose()
+      }
+    },
     inject(...args) { injected.push(args) },
+    effect(callback) {
+      effectDisposers.push(callback())
+      return () => {}
+    },
   }
 }
 
