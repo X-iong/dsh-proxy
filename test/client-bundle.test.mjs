@@ -125,14 +125,26 @@ test('it registers the third-party configuration seat for its own entry', () => 
   // host half's diagnostic checks against and the bundle patch declares.
   assert.deepEqual(gets, ['dsh-proxy'])
   assert.deepEqual(served, [['dsh-proxy']], 'the card appears only while the Host serves this entry')
-  assert.deepEqual(injected, ['plugins.row.config'], '`plugins.item` is reserved for the official host-plane plugins')
+  assert.deepEqual(
+    injected,
+    ['plugins.bundle.config', 'plugins.row.config'],
+    '`plugins.item` is reserved for the official host-plane plugins',
+  )
   assert.deepEqual(dicts.map((d) => [d.ns, d.locale]), [['dshProxy', 'zh'], ['dshProxy', 'en']])
   assert.deepEqual(Object.keys(dicts[0].dict).sort(), Object.keys(dicts[1].dict).sort(), 'the two dictionaries must stay balanced')
 
-  assert.equal(registered.length, 1)
+  // BOTH seats, or the user gets no configuration at all: the package detail page
+  // renders its configuration section only when `plugins.bundle.config` has an
+  // occupant for that package name, and `plugins.row.config` belongs to the row's
+  // own page.
+  assert.deepEqual(
+    registered.map(({ options }) => [options.name, options.key]),
+    [
+      ['plugins.bundle.config', 'dsh-proxy'],
+      ['plugins.row.config', 'dsh-proxy#dsh-proxy'],
+    ],
+  )
   const { options, component } = registered[0]
-  assert.equal(options.name, 'plugins.row.config')
-  assert.equal(options.key, 'dsh-proxy#dsh-proxy', 'the key is <bundle package name>#<row id>')
 
   // The business face the slot entry supplies: the bound selector hook's source,
   // the form actions, and the translate.

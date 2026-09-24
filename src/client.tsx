@@ -471,11 +471,31 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => () => { card.dispose() }, 'dsh-proxy: settings form subscription')
 
   ctx.effect(
-    () => ctx.configForms.whileServed([NS], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
-      name: 'plugins.row.config',
-      key: `${PKG}#${NS}`,
-      inject: () => card.inject(t),
-    }, ProxyCard))),
+    () => ctx.configForms.whileServed([NS], () => {
+      // Two seats, one form — registering only one of them leaves the user with
+      // nothing to configure, so both are claimed.
+      //
+      // `plugins.bundle.config` is keyed by the BUNDLE's package name and is the
+      // seat a user actually lands on: the Plugins page's package detail renders
+      // it in a section of its own — and renders that section ONLY when something
+      // registered here (`configured ? <section>… : null`). With no registration
+      // the package page shows its switch and no configuration at all.
+      //
+      // `plugins.row.config` is keyed `<package name>#<row id>` and belongs to the
+      // page of one row the bundle declares. Here the bundle's single row IS the
+      // plugin, so it renders the same form on that row's own page.
+      const disposeBundle = ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+        name: 'plugins.bundle.config',
+        key: PKG,
+        inject: () => card.inject(t),
+      }, ProxyCard))
+      const disposeRow = ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+        name: 'plugins.row.config',
+        key: `${PKG}#${NS}`,
+        inject: () => card.inject(t),
+      }, ProxyCard))
+      return () => { disposeBundle(); disposeRow() }
+    }),
     'dsh-proxy: configuration card',
   )
 }
