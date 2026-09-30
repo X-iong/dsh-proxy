@@ -1,7 +1,29 @@
 # 更新日志
 
 版本与 harness 的配对关系见 [README「兼容性」](README.md#兼容性先看这一节)。
-简言之：**0.3.2 / 0.3.3 面向 harness 0.1.7-rc.2 及以上；0.3.0 / 0.3.1 面向 0.1.7-rc.1；0.2.x 面向 0.1.6 及更早**，不可混用。
+简言之：**0.3.4 面向 harness 0.1.7-rc.2 ~ 0.2.0-rc.2；0.3.2 / 0.3.3 只面向 0.1.7-rc.2；0.3.0 / 0.3.1 面向 0.1.7-rc.1；0.2.x 面向 0.1.6 及更早**，不可混用。
+
+## 0.3.4 — 2026-10-01
+
+适配 DeepSeek Harness **0.2.0-rc.2**：把 `@deepseek-ai/dsh-client-ui-primitives` 的 peer 从精确值改为
+覆盖区间 `0.1.7-rc.2 || 0.2.0-rc.2`。**代码零改动，只有一个 peer 字段与版本号。**
+
+- 起因：harness 的 `evaluatePluginCompatibility`（`@deepseek-ai/dsh-app-boot`）会拿 profile 里每个插件的
+  `peerDependencies` 中所有 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 声明，去和**唯一的运行时版本**
+  `getDshRuntimeVersion()` 做 semver 比对（预发布版本参与匹配，`includePrerelease: true`）。
+  命中不匹配时该行**不会导入模块**，会被改成游离的 `disabled: true` 行。0.3.2 / 0.3.3 把这个 peer 钉成
+  精确值 `0.1.7-rc.2`，所以内核一升到 0.2.0，宿主就静默跳过本插件——不是崩溃，是不加载。
+- 判定用 peer 声明，**不看** `engines.dsh`：`engines` 那条 `>=0.1.7-rc.2` 对兼容性判定不起作用，
+  所以只改 `engines` 是没用的。
+- 为什么敢放宽：逐层比对了两版之间**本插件真正用到的 API 面**，全部无变化——
+  `dsh-client-ui-primitives` 的导出符号 `0.1.7-rc.2 → 0.2.0-rc.2` 为 **191 = 191，无增无删**；
+  客户端用到的三个服务（`slots` 的 `SlotRegistry` / `settings` 的 `ConfigForms` 的 `whileServed` /
+  `locale` 的 `LocaleRuntime`）在两版 `.d.ts` 里成员计数完全一致；宿主侧 `@deepseek-ai/cordis ~4.0.4`、
+  `@deepseek-ai/schemastery ~3.18.4`、`cordis-plugin-loader ~1.0.5` 两版 harness 声明相同。
+- **诚实边界**：以上是**静态对比**，不是流量验证——本机没有在真 0.2.0 运行时上跑过本插件的代理链路。
+  升级到 0.2.0-rc.2 后请用一个「必须经代理」的端点实测一次（见 README「工作原理」）。
+- `devDependencies` 里的同名包**保持 0.1.7-rc.2 不动**：两版导出面一致，类型检查结果不受影响，
+  升级它只会白白改动 lock 与 `node_modules`。
 
 ## 0.3.3 — 2026-09-24
 

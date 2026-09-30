@@ -10,9 +10,18 @@ English | [简体中文](README.md)
 
 | Plugin version | Harness it targets |
 |---|---|
-| **0.3.2** | **0.1.7-rc.2 and newer** |
+| **0.3.4** | **0.1.7-rc.2 through 0.2.0-rc.2** (including 0.2.0-rc.1) |
+| 0.3.2 / 0.3.3 | 0.1.7-rc.2 (a 0.2.0 runtime skips it — see below) |
 | 0.3.0 / 0.3.1 | 0.1.7-rc.1 |
 | 0.2.x | 0.1.5-rc.2 and older (0.2.8 is the last one, kept on the `v0.2.8` tag) |
+
+**0.3.4 changes exactly one peer field.** From harness 0.2.0 on, `evaluatePluginCompatibility` compares every
+`@deepseek-ai/dsh-*` entry in a plugin's `peerDependencies` against the single runtime version (the check reads
+peers only — **not** `engines.dsh`); a row that does not match **is never imported** and is turned into a
+detached `disabled: true` row. 0.3.2 / 0.3.3 pinned `dsh-client-ui-primitives` to the exact value `0.1.7-rc.2`,
+so a 0.2.0 runtime silently skips the plugin; 0.3.4 widens it to `0.1.7-rc.2 || 0.2.0-rc.2` and loads on both.
+The widening rests on a field-by-field comparison of the API surface this plugin actually uses across the two
+versions (primitives export symbols 191 = 191; the three client services it injects keep identical members).
 
 **Mind this table, especially the 0.3.1 → 0.3.2 step.** 0.3.1 on harness 0.1.7-rc.2 reports no error at all: the plugin mounts, the log announces "routing through it", and the configuration card reads "through the proxy" — while **not a single request actually leaves through the proxy**. The slot contract between Node's built-in `fetch` and undici changed; 0.3.2 restores it (see "How it works").
 
